@@ -8,5 +8,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Unit tests (no browser)
-        run: python -m unittest tests.test_v3_bench -q
+      - name: Spec and bench.json contracts
+        run: |
+          python - <<'PY'
+          import tests.test_v3_bench as t
+          for n in sorted(dir(t)):
+              if n.startswith("test_"):
+                  getattr(t, n)()
+                  print("ok", n)
+          PY
