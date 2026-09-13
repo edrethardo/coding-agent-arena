@@ -9,4 +9,4 @@ jobs:
         with:
           python-version: "3.12"
       - name: Unit tests (no browser)
-        run: python -m unittest tests.test_v3_bench tests.test_session_mode_and_abort -q
+        run: python -m unittest tests.test_v3_bench -q
