@@ -55,7 +55,13 @@ Selbsttest der Fixtures:
 
 ```bash
 .venv/bin/python benchmarks/antifa_survivors_v3/grader_selftest.py
-python3 -m unittest tests.test_v3_bench tests.test_v3_fixtures tests.test_collect_builds -q
+python - <<'PY'
+import tests.test_v3_bench as t
+for n in sorted(dir(t)):
+    if n.startswith("test_"):
+        getattr(t, n)()
+        print("ok", n)
+PY
 ```
 
 ## Eine Zeile fahren
