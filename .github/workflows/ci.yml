@@ -1,0 +1,12 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Unit tests (no browser)
+        run: python -m unittest tests.test_v3_bench tests.test_session_mode_and_abort -q

@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+# Gates, die v3 zusaetzlich zu bin/arena-run verlangt. Bricht bei jedem Verstoss ab.
+#   bin/arena-preflight-v3 --row v3-cc-opus-5 [--game antifa_survivors_v3]
+set -uo pipefail
+cd "$(dirname "$0")/.."
+ROW=""; GAME=antifa_survivors_v3
+while [ $# -gt 0 ]; do case "$1" in --row) ROW="$2"; shift;; --game) GAME="$2"; shift;; *) echo "unknown $1" >&2; exit 64;; esac; shift; done
+[ -n "$ROW" ] || { echo "--row required" >&2; exit 64; }
+B="benchmarks/$GAME"; fail=0
+ok(){ printf '  \033[32mok\033[0m    %s\n' "$1"; }; bad(){ printf '  \033[31mFAIL\033[0m  %s\n' "$1"; fail=1; }
+echo "preflight-v3: row=$ROW game=$GAME"
+
+# Grader eingefroren und unveraendert
+want=$(.venv/bin/python -c "import json;print(json.load(open('$B/bench.json')).get('grader_sha256') or '')")
+have=$(sha256sum "$B/grader.py" | cut -c1-16)
+if [ -z "$want" ]; then bad "grader_sha256 not frozen in bench.json -- run grader_selftest.py, then freeze (Task 9)"
+elif [ "$want" != "$have" ]; then bad "grader.py changed since freeze ($have != $want)"; else ok "grader           frozen $have"; fi
+
+# Proxy-Port frei, Upstream erreichbar
+read -r dialect upstream port < <(.venv/bin/python -c "
+import run_game_bench as r; d,u,p = r.PROXY['$ROW']; print(d,u,p)" 2>/dev/null) || { bad "row $ROW has no PROXY entry"; }
+if [ -n "${port:-}" ]; then
+  if ss -ltn "( sport = :$port )" | grep -q ":$port"; then bad "proxy port $port already in use"; else ok "proxy port       $port free ($dialect -> $upstream)"; fi
+  if [ "$dialect" = anthropic ]; then
+    code=$(curl -s -o /dev/null -w '%{http_code}' -m 15 "$upstream/v1/messages" -X POST -H 'content-type: application/json' -d '{}')
+    [ "$code" != 000 ] && ok "upstream         api.anthropic.com answers ($code)" || bad "api.anthropic.com unreachable"
+  elif [ "$dialect" = codex ]; then
+    # Codex uses /responses, not OpenAI chat-completions. Its OAuth credential and the
+    # exact loopback base_url must both belong to this row, otherwise calls silently bypass
+    # the trace proxy and the analytics record is incomplete.
+    read -r codex_home codex_model < <(.venv/bin/python -c "
+import run_game_bench as r
+w = r.WRAPPERS['$ROW']; e = w[1] or {}; print(e.get('HERMES_HOME', ''), e.get('HERMES_MODEL', ''))")
+    if [ -z "$codex_home" ] || [ ! -f "$codex_home/config.yaml" ]; then
+      bad "codex profile     missing config for $ROW"
+    elif HERMES_HOME="$codex_home" hermes auth status openai-codex 2>/dev/null | grep -qi "logged out"; then
+      bad "codex auth        openai-codex logged out in $codex_home"
+    else
+      ok "codex auth        openai-codex logged in ($codex_model)"
+    fi
+    want="http://127.0.0.1:$port"
+    got=$(HERMES_HOME="$codex_home" hermes config get model.base_url 2>/dev/null || true)
+    [ "$got" = "$want" ] && ok "variant base_url  $got" || bad "variant base_url  $got (want $want: analytics proxy)"
+  else
+    LOCK_BIN="${ARENA_GPU_LOCK_BIN:-$HOME/.claude/skills/gpu-lock/gpu-lock.sh}"
+    holder=$("$LOCK_BIN" status 2>&1 | head -1)
+    case "$holder" in
+      "no locks"|*arena*)
+        ok "gpu lock         $holder"
+        # Only now -- lock confirmed free or ours -- may :8000 be contacted at all.
+        QWEN_BASE_URL="${QWEN_BASE_URL:-http://127.0.0.1:8000/v1}"
+        FP_URL="${ARENA_VLLM_METRICS_URL:-}"
+        # The expected window comes from the VARIANT ITSELF (model.context_length in its own
+        # config.yaml), not a row-name suffix -- a "*131k" name hack stops meaning anything the
+        # moment a window gets renamed (rec3-131k briefly became rec3-98k on 2026-09-11, then
+        # was reverted the same day -- see bin/hermes-variant). The pool at a given window is
+        # not one number either: the box has served 65536 over bfloat16 (68605 pool), and
+        # 131072 over BOTH int8_per_token_head (136429) and KVarN (209132, not the 268169 in
+        # KVarN's own README -- that figure is for ITS default window, 245760, not any window
+        # we serve). Keyed by (window, dtype), matched +-2% since the exact reported pool moves
+        # a little between stack builds; an unknown (window, dtype) combination FAILs with the
+        # full known table rather than silently passing.
+        #
+        # The pool is NOT constant across windows for a given dtype either -- it is a property
+        # of allocated GPU memory, and it GROWS with the requested window. Three points the box
+        # measured directly: 81920 -> pool 164297 -> ratio 2.006; 98304 -> pool 180980 -> ratio
+        # 1.84; 131072 -> pool 209132 -> ratio 1.60 (roughly pool ~= 96524 + 0.859*window in
+        # tokens -- a fit, not a law; a NEW window needs its own measured table entry, not an
+        # assumed/interpolated one). EVERY window > 65536 requires the pool to hold at least
+        # 1.25 full windows (kv_cache_size_tokens >= 1.25 * context_length), replacing the
+        # earlier flat >= 2.0 floor. That 2.0 figure was inherited from the era when eight rows
+        # shared one endpoint and real concurrent requests needed two windows of headroom; it
+        # was applied to this single-row, strictly-sequential experiment by mistake. Our own
+        # proxy traces settle the actual question directly: across all four Qwen rows,
+        # `inflight` was 1 in 2247 of 2248 model calls (rec 299/299, rec2 223/223, rec3
+        # 740/740, stock 985/986) -- Hermes never overlaps compaction with the main request, so
+        # this row needs one window of pool plus margin, not two. 1.25 is that margin.
+        serving_check=$(.venv/bin/python - "$ROW" "$QWEN_BASE_URL" "$FP_URL" <<'PYEOF' 2>&1
+import sys, re, os, urllib.request, json
+import run_game_bench as r
+import vllm_metrics
+
+row, base_url, fp_url = sys.argv[1], sys.argv[2], (sys.argv[3] or None)
+
+home = (r.WRAPPERS[row][1] or {}).get("HERMES_HOME") if row in r.WRAPPERS else None
+if not home:
+    print(f"FAIL  row {row} has no HERMES_HOME -- cannot read its model.context_length")
+    raise SystemExit
+cfg_path = os.path.join(home, "config.yaml")
+if not os.path.exists(cfg_path):
+    print(f"FAIL  {cfg_path} missing -- regenerate with bin/hermes-variant")
+    raise SystemExit
+text = open(cfg_path).read()
+m = re.search(r"^model:\n(?:  .*\n)*?  context_length:[ \t]*(\S+)", text, re.M)
+if not m:
+    print(f"FAIL  no model.context_length in {cfg_path}")
+    raise SystemExit
+want_len = int(m.group(1))
+require_concurrency = want_len > 65536
+
+# (window, dtype) -> known-good kv_cache_size_tokens pool, +-2%. The pool is NOT a constant
+# per dtype -- it is a property of allocated GPU memory and grows with the requested window
+# (measured: 81920->164297, 98304->180980, 131072->209132, roughly pool ~= 96524 + 0.859*L).
+# A new window needs its own measured entry here, not an assumed/interpolated one.
+POOL_TABLE = {
+    (65536,  "bfloat16"):            68605,
+    (81920,  "kvarn_k4v2_g128"):     164297,
+    (98304,  "kvarn_k4v2_g128"):     180980,
+    (131072, "int8_per_token_head"): 136429,
+    (131072, "kvarn_k4v2_g128"):     209132,
+}
+
+def within_tolerance(have, want, pct=0.02):
+    return abs(have - want) <= want * pct
+
+try:
+    with urllib.request.urlopen(f"{base_url}/models", timeout=20) as resp:
+        data = json.load(resp)
+    models = data.get("data") or []
+    have_len = models[0].get("max_model_len") if models else None
+except Exception as exc:
+    print(f"FAIL  {base_url}/models unreachable: {type(exc).__name__}: {exc}")
+    raise SystemExit
+
+fp = vllm_metrics.stack_fingerprint(url=fp_url)
+dtype = fp.get("cache_dtype")
+try:
+    pool = int(fp.get("kv_cache_size_tokens"))
+except (TypeError, ValueError):
+    pool = None
+
+reasons = []
+if have_len != want_len:
+    reasons.append(f"max_model_len {have_len} != {want_len} (this variant's model.context_length)")
+
+want_pool = POOL_TABLE.get((want_len, dtype))
+if want_pool is None:
+    known = ", ".join(f"{w}/{d}={p}" for (w, d), p in sorted(POOL_TABLE.items()))
+    reasons.append(f"no known-good pool for window={want_len} dtype={dtype} -- known combinations: {known}")
+elif pool is None or not within_tolerance(pool, want_pool):
+    reasons.append(f"kv_cache_size_tokens {pool} != {want_pool} (+-2%) for window={want_len} dtype={dtype}")
+
+# Derived from OUR OWN two measured numbers (pool, want_len), not vLLM's own reported
+# kv_cache_max_concurrency field -- the pool must hold at least 1.25 full windows. Hermes is
+# strictly sequential (inflight == 1 in 2247/2248 calls, measured across all four Qwen rows),
+# so compaction never overlaps the main request and this row never needs two windows of
+# headroom, just one plus margin. Replaces the old flat >= 2.0 floor (a leftover from the
+# parallel-row era) for every window above 65536.
+ratio = (pool / want_len) if (pool is not None and want_len) else None
+if require_concurrency and (ratio is None or ratio < 1.25):
+    reasons.append(f"pool/window ratio {ratio} < 1.25 -- kv_cache_size_tokens must be >= 1.25 * context_length for any window > 65536")
+
+summary = (f"window={want_len} max_model_len={have_len} dtype={dtype} pool={pool} "
+           f"ratio={ratio} concurrency={ratio}")
+print(("FAIL  " if reasons else "OK    ") + ("; ".join(reasons) + " -- " if reasons else "") + summary)
+PYEOF
+)
+        case "$serving_check" in
+          OK*)   ok "serving          ${serving_check#OK    }" ;;
+          *)     bad "serving stack mismatch: ${serving_check#FAIL  }" ;;
+        esac
+        ;;
+      *)
+        bad "gpu lock held by someone else: $holder"
+        ;;
+    esac
+  fi
+fi
+
+# Die base_url der Varianten-Config muss auf den Proxy-Port DIESER Zeile zeigen. Sonst laeuft
+# die Zeile am Proxy vorbei (oder in den Proxy einer anderen Zeile), und die Spans, die
+# Analytics und Bericht tragen, gehoeren der falschen Zeile -- ohne dass irgendetwas scheitert.
+if [ -n "${port:-}" ]; then
+  base_url_check=$(.venv/bin/python - "$ROW" "$port" <<'PYEOF' 2>&1
+import re, sys, os
+from urllib.parse import urlparse
+import run_game_bench as r
+row, want_port = sys.argv[1], int(sys.argv[2])
+home = (r.WRAPPERS[row][1] or {}).get("HERMES_HOME")
+if not home:
+    print("SKIP  row has no HERMES_HOME (not a hermes row)")
+    raise SystemExit
+cfg = os.path.join(home, "config.yaml")
+if not os.path.exists(cfg):
+    print(f"FAIL  {cfg} missing -- regenerate with bin/hermes-variant")
+    raise SystemExit
+text = open(cfg).read()
+m = re.search(r"^model:\n(?:  .*\n)*?  base_url:[ \t]*(\S+)", text, re.M)
+if not m:
+    print(f"FAIL  no model.base_url in {cfg}")
+    raise SystemExit
+url = m.group(1).strip().strip("'\"")
+got = urlparse(url).port
+if got == want_port:
+    print(f"OK    {url}")
+else:
+    print(f"FAIL  {cfg}: base_url {url} -> port {got}, but this row's proxy is {want_port}")
+PYEOF
+)
+  case "$base_url_check" in
+    OK*)   ok "variant base_url ${base_url_check#OK}" ;;
+    SKIP*) ok "variant base_url ${base_url_check#SKIP}" ;;
+    *)     bad "${base_url_check#FAIL  }" ;;
+  esac
+fi
+
+# Credentials
+case "$ROW" in
+  v3-hermes-claude-*) home=$(.venv/bin/python -c "import run_game_bench as r;print(r.WRAPPERS['$ROW'][1]['HERMES_HOME'])")
+     # `grep -qv "logged out"` passed whenever ANY line of the output lacked the phrase --
+     # a header line alone satisfied it, so a logged-out provider read as a credential.
+     # Test FOR the phrase, and treat no output at all as a failure too (a hermes that
+     # cannot run says nothing, which the old form also read as "logged in").
+     authout=$(HERMES_HOME="$home" ~/.local/bin/hermes auth status anthropic 2>/dev/null)
+     if [ -z "$authout" ]; then bad "hermes auth status anthropic said nothing under $home"
+     elif printf '%s' "$authout" | grep -qi "logged out"; then bad "hermes anthropic logged out under $home"
+     else ok "credential       hermes anthropic ($home)"; fi ;;
+  v3-cc-*) ~/.local/bin/claude auth status >/dev/null 2>&1 && ok "credential       claude code" || bad "claude code not logged in" ;;
+esac
+[ "$fail" -eq 0 ] && echo "preflight-v3 passed" || { echo "preflight-v3 FAILED"; exit 1; }

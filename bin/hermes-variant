@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+# Legt eine Hermes-Wurzel fuer eine v3-Zeile an. Vorlage ist ~/.hermes-arena/prune28k (bekannt
+# lauffaehig), NICHT ~/.hermes: die Arbeitsinstallation bleibt unberuehrt.
+#   bin/hermes-variant v3-rec        --port 8010
+#   bin/hermes-variant v3-claude-opus-5 --port 8020 --anthropic
+set -euo pipefail
+NAME="${1:?name}"; shift
+PORT=""; ANTH=0
+while [ $# -gt 0 ]; do case "$1" in --port) PORT="$2"; shift;; --anthropic) ANTH=1;; *) echo "unknown $1" >&2; exit 64;; esac; shift; done
+[ -n "$PORT" ] || { echo "--port required" >&2; exit 64; }
+ROOT="$HOME/.hermes-arena/$NAME"; TPL="$HOME/.hermes-arena/prune28k"
+[ -d "$TPL" ] || { echo "template $TPL missing" >&2; exit 1; }
+mkdir -p "$ROOT"
+for d in bin cache cron hooks audio_cache; do [ -d "$TPL/$d" ] && cp -r "$TPL/$d" "$ROOT/"; done
+ln -sfn "$HOME/.hermes/auth.json" "$ROOT/auth.json"
+python3 - "$ROOT/config.yaml" "$HOME/.hermes/config.yaml" "$NAME" "$PORT" "$ANTH" <<'PY'
+import re, sys
+out, src, name, port, anth = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5] == "1"
+t = open(src).read()
+def setkey(text, section, key, val):
+    """setzt section.key (2-Leerzeichen-Einrueckung); fuegt ein, wenn es fehlt."""
+    pat = re.compile(rf"^({section}:\n(?:  .*\n)*?)  {key}:.*$", re.M)
+    if pat.search(text): return pat.sub(lambda m: m.group(1) + f"  {key}: {val}", text, count=1)
+    return re.sub(rf"^({section}:\n)", lambda m: m.group(1) + f"  {key}: {val}\n", text, count=1, flags=re.M)
+def delkey(text, section, key):
+    return re.sub(rf"^({section}:\n(?:  .*\n)*?)  {key}:.*\n", lambda m: m.group(1), text, count=1, flags=re.M)
+def strip_toplevel(text, key):
+    """Entfernt einen kompletten Top-Level-Abschnitt (key: ... bis zur naechsten
+    Top-Level-Zeile oder Dateiende) -- fuer Abschnitte, die keine Qwen-Variante betreffen,
+    aber aus ~/.hermes/config.yaml mitkopiert wuerden, sobald sie dort auftauchen."""
+    return re.sub(rf"^{key}:\n(?:  .*\n|\n)*", "", text, count=1, flags=re.M)
+if anth:
+    t = setkey(t, "model", "provider", "anthropic")
+    # Hostname MUST contain "anthropic.com" -- agent/anthropic_endpoints.py classifies any
+    # base_url that doesn't as a third-party endpoint, sends the OAuth token as a bare
+    # x-api-key header (no OAuth beta headers), gets a 401 on the first call, and then
+    # bypasses the proxy entirely. An /etc/hosts alias would need sudo the user hasn't given,
+    # so arena-proxy.anthropic.com.localhost is used instead: any *.localhost name resolves
+    # system-wide to ::1 with no hosts entry at all (verified: `getent hosts
+    # arena-proxy.anthropic.com.localhost`), and the name still contains "anthropic.com". The
+    # /anthropic path suffix is back on purpose too: Hermes's override check accepts a
+    # non-anthropic.com hostname only with that path marker present, and the proxy strips it
+    # before forwarding upstream.
+    t = setkey(t, "model", "base_url", f"http://arena-proxy.anthropic.com.localhost:{port}/anthropic")
+    t = delkey(t, "model", "api_key"); t = delkey(t, "model", "context_length")
+else:
+    t = setkey(t, "model", "base_url", f"http://127.0.0.1:{port}/v1")
+    v = name.replace("v3-", "")
+    # Jede Variante ist v3-rec plus GENAU ein Unterschied (Spec 4.2) -- das gilt nur, wenn
+    # jeder Knopf, der nicht der Unterschied ist, auch gesetzt ist. context_length und
+    # reasoning_effort standen bisher nur dort, wo sie der Unterschied waren, und wurden
+    # sonst aus ~/.hermes/config.yaml geerbt: aendert der Nutzer seine Arbeitsinstallation,
+    # aendert sich die Referenz mit, und der Vergleich misst zwei Unterschiede statt einem.
+    # Deshalb zuerst die Referenzwerte pinnen, dann den einen Unterschied daruebersetzen.
+    # 2026-09-10: genau das ist eingetreten -- Aarons Arbeitsinstallation zeigt jetzt auf
+    # claude-opus-5/anthropic (model.default/model.provider), und model.api_key verschwand
+    # ganz aus der Quelle. Ohne diese vier Pins haette eine JETZT erzeugte Qwen-Variante
+    # provider: anthropic geerbt -- custom_providers (rec3/rec4) matcht dann nie, weil
+    # _custom_provider_extra_body_for_agent provider: custom voraussetzt.
+    t = setkey(t, "model", "default", "Qwen3.8-27B-Instruct")
+    t = setkey(t, "model", "provider", "custom")
+    t = setkey(t, "model", "api_key", "not-needed")
+    t = setkey(t, "model", "context_length", "65536")
+    t = setkey(t, "agent", "reasoning_effort", "medium")
+    # model_aliases is a root-level Claude-model shortcut list that has nothing to do with
+    # a Qwen row; strip it if the source now carries one (same drift as above).
+    t = strip_toplevel(t, "model_aliases")
+    if v in ("rec", "rec-low", "rec-131k"):
+        # threshold_tokens caps the prompt BEFORE the model's own output and the compaction
+        # request itself get added on top. S-044433 (Qwen integration run): at 49000 with
+        # max_tokens 16384, round 2 hit prompt 53,567 + output 16,384 > window 65,536 -> vLLM
+        # 400 ("max compression attempts (3) reached"), because 49000 + 16384 = 65384 left
+        # only 152 tokens of headroom for the compaction call itself, not enough. Spec Sec4.2
+        # (updated): 40000 = window(65536) - max_tokens(16384) - ~9k reserve for the
+        # compaction request and the round's growth before the next compression pass fires.
+        t = setkey(t, "model", "max_tokens", "16384"); t = setkey(t, "compression", "threshold_tokens", "40000")
+    if v == "rec-low": t = setkey(t, "agent", "reasoning_effort", "low")
+    if v == "rec-131k": t = setkey(t, "model", "context_length", "131072")
+    if v in ("rec2", "rec2-low", "rec3", "rec4", "rec3-131k", "rec3-131k-prune", "rec3-131k-prune-hygiene"):
+        # rec2 is a CORRECTED BUNDLE, not a one-knob variant of rec -- it deliberately breaks
+        # the one-key discipline above, and that is the point, not an oversight. rec's round 1
+        # timed out: threshold_tokens 40000 with protect_last_n 20 (~27k tokens of protected
+        # tail, never eligible to shrink) and target_ratio 0.2 (a ~13k-token summary) meant
+        # every compaction landed right back at the threshold it started from -- every second
+        # call became a compaction, and the round never finished. Aaron closed the row. The
+        # fix touches the two knobs that determine how much a compaction actually reclaims
+        # (tail size, summary size), not the threshold that triggers it: threshold_tokens back
+        # up to 49000 (headroom was never the problem once compaction reclaims properly),
+        # protect_last_n down to 6 (a much smaller floor that can't be pinned to the ceiling),
+        # target_ratio down to 0.1 (a tighter summary, more actually reclaimed per pass).
+        # max_tokens/context_length/reasoning_effort stay at the pinned reference values above.
+        # rec3 and rec4 are rec2's bundle too -- their own difference (below) is additive on top.
+        t = setkey(t, "compression", "threshold_tokens", "49000")
+        t = setkey(t, "compression", "protect_last_n", "6")
+        t = setkey(t, "compression", "target_ratio", "0.1")
+        t = setkey(t, "model", "max_tokens", "16384")
+    if v in ("rec2-low", "rec3", "rec3-131k", "rec3-131k-prune", "rec3-131k-prune-hygiene"): t = setkey(t, "agent", "reasoning_effort", "low")
+    if v in ("rec3", "rec3-131k", "rec3-131k-prune", "rec3-131k-prune-hygiene"):
+        # rec3 = rec2-low + ONE more thing: a custom_providers entry that silences thinking
+        # in Hermes's AUXILIARY (compaction) call only, leaving the main call's reasoning_effort
+        # untouched. Verified against vLLM 0.27.1 (GPU Master): vLLM's merge_kwargs lets a
+        # top-level `reasoning_effort` on a request win over provider-level
+        # chat_template_kwargs -- the main model call sends reasoning_effort: low at the top
+        # level and keeps it. Hermes's compaction call carries NO top-level reasoning_effort
+        # (its own effort setting goes out as extra_body.reasoning, a field vLLM does not read
+        # for chat-template selection), so for that call ONLY the provider-level
+        # chat_template_kwargs is what decides the template's reasoning_effort -- and today
+        # that resolves to the template default (xhigh), which is ~11k tokens of thinking
+        # spent on every single compaction summary. Matched by agent/agent_init.py
+        # _custom_provider_extra_body_for_agent: base_url must equal model.base_url EXACTLY
+        # (normalizer only strips a trailing "/", so the /v1 suffix must match too), and
+        # model.provider must be "custom" or "custom:<name>" (already "custom" here, unchanged
+        # by this branch) -- no `model:` key on the entry, so it is the provider's fallback
+        # extra_body, applied to every model that provider serves (there's only one). rec3-131k
+        # carries this same knob unchanged -- its own difference (below) is additive on top,
+        # not a replacement, and the entry's base_url is kept in sync with ITS OWN port.
+        t += (
+            "custom_providers:\n"
+            f"  - name: arena-{v}-compaction\n"
+            f"    base_url: http://127.0.0.1:{port}/v1\n"
+            "    extra_body:\n"
+            "      chat_template_kwargs:\n"
+            '        reasoning_effort: "none"\n'
+        )
+    if v in ("rec3-131k", "rec3-131k-prune", "rec3-131k-prune-hygiene"):
+        # rec3-131k = rec3 (the same custom_providers block above, base_url re-synced to this
+        # row's own port by the f-string) plus exactly the two changes the bigger window
+        # forces. Originally built as rec3-131k; renamed to rec3-98k on 2026-09-11 when a flat
+        # kv_cache_max_concurrency >= 2.0 gate (inherited from the era when eight rows shared
+        # one endpoint) read 131072/209132 = 1.60 as a FAIL and the box could not serve more
+        # pool at 131072 (1.24 GiB short, only 1.5 GiB free, spec-decode buffer needs the
+        # rest). Reverted back to rec3-131k the same day, once two things were actually
+        # measured rather than assumed:
+        #
+        # (1) The pool is NOT constant across windows -- three measured points on the box:
+        # 131072 -> pool 209132 -> concurrency 1.60; 98304 -> pool 180980 -> 1.84; 81920 ->
+        # pool 164297 -> 2.006 (fit: pool ~= 96524 + 0.859*L). A flat >= 2.0 floor was
+        # penalizing this row for a pool that grows with the window, not measuring anything
+        # true about the row itself.
+        #
+        # (2) The 2.0 figure was standing in for a real question -- "can compaction overlap
+        # the main request and need a second window of headroom?" -- that our own proxy
+        # traces already answer directly: across all four Qwen rows, `inflight` was 1 in 2247
+        # of 2248 model calls (rec 299/299, rec2 223/223, rec3 740/740, stock 985/986). Hermes
+        # is strictly sequential -- compaction never overlaps the main request -- so this row
+        # needs one window of pool plus headroom, not two. bin/arena-preflight-v3's gate now
+        # requires kv_cache_size_tokens >= 1.25 * context_length instead of a flat 2.0x --
+        # 131072/209132 = 1.60, comfortably above that floor. The 2.0 number itself was a
+        # leftover from the earlier parallel-row campaign (eight rows sharing one endpoint,
+        # where headroom for real concurrent requests mattered) applied here by mistake to a
+        # single sequential row.
+        #
+        # model.context_length: 131072 -- Hermes reads context_length as an OVERRIDE, not a
+        # discovery. Leaving it at 65536 (rec3's value) while the server actually serves
+        # 131072 would keep compaction pinned to a 65536-sized budget regardless of what the
+        # box can now hold -- the exact v2 trap: the server was doubled to 131072 on
+        # 2026-09-09 with nothing in the harness noticing, because nothing here read the
+        # window from the server either. This config would run the same silent lie again.
+        #
+        # compression.threshold_tokens: 90000 -- measured sizes: the build is ~109 kB (~30k
+        # tokens) plus ~15k tokens of spec/system, so one read of the game file is ~43k
+        # tokens, and read-plus-write-back (the round's own pattern) is ~71k -- 90000 is the
+        # first threshold that holds both with margin. 131072 - 90000 = 41072 tokens of
+        # generation room -- rec3 sends no max_tokens at all (unlike rec4), so this is
+        # measured headroom, not a hard budget: compaction summaries under rec3's
+        # non-thinking knob run ~9800 tokens measured, comfortably inside 41072.
+        t = setkey(t, "model", "context_length", "131072")
+        t = setkey(t, "compression", "threshold_tokens", "90000")
+    if v in ("rec3-131k-prune", "rec3-131k-prune-hygiene"):
+        # Sole delta from rec3-131k: shrink old large tool results before a
+        # compaction pass, which targets the observed r4 exhaustion directly.
+        t = setkey(t, "compression", "proactive_prune_tokens", "30000")
+        t = setkey(t, "compression", "proactive_prune_min_result_chars", "4000")
+        t = setkey(t, "compression", "proactive_prune_min_reclaim_tokens", "4096")
+    if v == "rec4":
+        # rec4 = v3-rec2 (NOT rec2-low -- reasoning_effort stays medium) plus TWO additions,
+        # both aimed at the same measured problem: on live runs, tool results (the growing
+        # game file, read back each round) were 27-54% of every Qwen prompt (median 40% in
+        # rec2's round 2, single results up to 71k characters), and -- separately, confirmed
+        # by reading run_agent.py/hermes_cli/cli_agent_setup_mixin.py -- the CLI's own agent
+        # construction never passes max_tokens= from model.max_tokens at all (AIAgent.__init__
+        # defaults it to None; agent.max_tokens stays None for the whole session), so
+        # model.max_tokens: 16384 above has been a DEAD SETTING for every prior variant
+        # (rec/rec2/rec3 included) -- it never reached the wire, and single generations ran
+        # up to 50k tokens. Confirmed via agent/transports/chat_completions.py
+        # _apply_max_tokens: it only sets a wire max_tokens from params["max_tokens"]
+        # (== agent.max_tokens) or a provider profile's max, both None/absent here.
+        #
+        # (1) Proactive pruning -- deterministic, no extra LLM call -- shrinks a large tool
+        # result BEFORE compaction is needed, so growth from repeatedly re-reading the same
+        # giant file doesn't drive every round to a compaction. Keys read straight from
+        # agent/context_compressor.py's ContextCompressor.__init__ (confirmed against
+        # source, not assumed -- names match the ruling verbatim, no renaming needed):
+        # proactive_prune_tokens (arm the pass once the running token count crosses this;
+        # 30000 is comfortably below threshold_tokens 49000, so pruning gets a chance to work
+        # before compaction would trigger anyway), proactive_prune_min_result_chars (a tool
+        # result must be at least this many chars to be a candidate; floored at
+        # _PRUNE_MIN_CHARS=200 in context_compressor.py, so the requested 4000 passes through
+        # unclamped), proactive_prune_min_reclaim_tokens (skip the pass if it wouldn't reclaim
+        # at least this many tokens). NOTE: this last one is already 4096 in
+        # ~/.hermes/config.yaml (the template every variant inherits), so setting it to 4096
+        # again here is a no-op in TEXT -- it will NOT show as a diff line against v3-rec2,
+        # unlike the other two keys. Set explicitly anyway so rec4's config does not silently
+        # depend on the template's current default if that default ever changes.
+        #
+        # (2) A custom_providers entry, same delivery path as rec3 (matched by base_url +
+        # provider: custom, see rec3's comment above) -- but extra_body carries ONLY
+        # max_tokens here, no chat_template_kwargs; chat_template_kwargs is rec3's knob, not
+        # this one. Unlike model.max_tokens, extra_body reaches the OpenAI SDK's extra_body
+        # mechanism and is merged into the actual wire JSON body, so this is the cap that
+        # finally takes effect where model.max_tokens never did.
+        #
+        # 32768, not 16384: measured on live traffic, calls above 16384 output tokens are only
+        # 2% of all calls, but that 2% is exactly (a) pathological thinking bursts (40-163k
+        # chars of thinking) and (b) Hermes's OWN compaction summaries (18-25k output tokens,
+        # ~30k chars, stop: stop, no tool use) -- a 16384 cap would truncate the compaction
+        # summary itself and reproduce the very "max compression attempts (3) reached" death
+        # rec2 exists to prevent. 32768 sits above the observed summaries and below the
+        # 40-50k pathological bursts. rec4 does NOT carry rec3's chat_template_kwargs knob, so
+        # its compaction call still reasons like any other call before answering -- a LOWER
+        # cap here is only safe for a variant that also silences compaction's thinking (rec3's
+        # reasoning_effort: "none"), which is not this one.
+        t = setkey(t, "compression", "proactive_prune_tokens", "30000")
+        t = setkey(t, "compression", "proactive_prune_min_result_chars", "4000")
+        t = setkey(t, "compression", "proactive_prune_min_reclaim_tokens", "4096")
+        t += (
+            "custom_providers:\n"
+            "  - name: arena-rec4-max-tokens\n"
+            f"    base_url: http://127.0.0.1:{port}/v1\n"
+            "    extra_body:\n"
+            "      max_tokens: 32768\n"
+        )
+open(out, "w").write(t)
+print(f"wrote {out}")
+PY

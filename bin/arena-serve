@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Publish every graded build in this repo on the tailnet, each round at its own URL.
+#
+#   bin/arena-serve                 collect, (re)start the server, wire tailscale serve
+#   bin/arena-serve --refresh       re-collect only; the running server picks it up
+#   bin/arena-serve --status        what is published and where
+#   bin/arena-serve --stop          unpublish from the tailnet and stop the server
+#
+# One round is one build, and a round is only comparable to its neighbours if you can put
+# them side by side -- so every round of every run gets a stable URL of its own instead of
+# a single "latest" that overwrites its predecessor. This is the serving counterpart of
+# keeping runs in runs/<run_id>/: nothing is overwritten by a later round.
+#
+# tailnet only. `tailscale serve` publishes to the tailnet; `tailscale funnel` would put
+# it on the public internet and is deliberately not used anywhere in this script.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+REPO=$(pwd -P)
+
+ROOT="${ARENA_SERVE_ROOT:-$HOME/arena-serve}"
+PORT="${ARENA_SERVE_PORT:-8791}"
+MOUNT="${ARENA_SERVE_PATH:-/arena}"
+PIDFILE="$ROOT/.server.pid"
+
+collect() {
+  mkdir -p "$ROOT"
+  rm -rf "$ROOT/builds"; mkdir -p "$ROOT/builds"
+  .venv/bin/python tools/collect_builds.py "$REPO" "$ROOT" "$MOUNT" || return 1
+}
+
+serving_url() {
+  local host; host=$(tailscale status --json 2>/dev/null \
+    | .venv/bin/python -c 'import json,sys;print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))' 2>/dev/null)
+  [ -n "$host" ] && echo "https://$host$MOUNT/" || echo "(tailnet name unavailable)"
+}
+
+case "${1:-}" in
+  --status)
+    echo "serve root : $ROOT"
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+      echo "server     : running, pid $(cat "$PIDFILE"), 127.0.0.1:$PORT"
+    else echo "server     : not running"; fi
+    echo "url        : $(serving_url)"
+    echo "builds     : $(find "$ROOT/builds" -name index.html 2>/dev/null | wc -l)"
+    echo
+    tailscale serve status 2>&1 | sed 's/^/  /'
+    exit 0 ;;
+  --stop)
+    # Remove ONLY our own mount. The tailnet host serves other things on other paths.
+    tailscale serve --https=443 --set-path "$MOUNT" off 2>/dev/null \
+      || sudo -n tailscale serve --https=443 --set-path "$MOUNT" off 2>/dev/null
+    [ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")" 2>/dev/null && rm -f "$PIDFILE"
+    echo "unpublished $MOUNT and stopped the server"
+    exit 0 ;;
+  --refresh)
+    collect && echo "re-collected -- the running server serves from disk, nothing to restart"
+    exit $? ;;
+esac
+
+collect || exit 1
+
+# Bound to loopback on purpose: tailscale serve is the only way in, so the port is not
+# exposed on the LAN even if the tailnet ACL changes.
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+  echo "server already running (pid $(cat "$PIDFILE"))"
+else
+  nohup setsid .venv/bin/python tools/serve_builds.py "$ROOT" "$PORT" "$MOUNT" \
+        > "$ROOT/.server.log" 2>&1 &
+  echo $! > "$PIDFILE"
+  sleep 1
+  kill -0 "$(cat "$PIDFILE")" 2>/dev/null || { echo "server failed to start; see $ROOT/.server.log" >&2; exit 1; }
+  echo "server started on 127.0.0.1:$PORT (pid $(cat "$PIDFILE"))"
+fi
+
+# Additive: --set-path touches only this path and leaves every other mount alone.
+if ! tailscale serve --bg --https=443 --set-path "$MOUNT" "http://127.0.0.1:$PORT" 2>/dev/null; then
+  sudo -n tailscale serve --bg --https=443 --set-path "$MOUNT" "http://127.0.0.1:$PORT" || {
+    echo "could not publish to the tailnet -- the server is up at 127.0.0.1:$PORT" >&2; exit 1; }
+fi
+
+echo
+echo "published on the tailnet (tailnet only, not funnel):"
+echo "  $(serving_url)"

@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# Re-score every archived build with the CURRENT grader, without touching the evidence.
+#
+#   bin/arena-regrade                 dry run: what would change
+#   bin/arena-regrade --apply         also write regrade-<stamp>.json into each run dir
+#   bin/arena-regrade --game <g>      restrict to one benchmark
+#
+# Why this exists. The grader's keyboard test was wrong: it tapped keys instead of holding
+# them, so a build whose keyboard works perfectly measured +0.0 and the gate stopped at 2
+# for every build of every model. Fixed 2026-09-09. Every round graded before that carries
+# a number produced by the broken test.
+#
+# The builds are archived per round, and the score never reaches the agent -- its prompt is
+# the spec, the round's scope and its own file -- so a score can be recomputed at any time
+# without re-running anything. That is the whole reason runs/<id>/r<n>/index.html is kept.
+#
+# It writes a SEPARATE file and never edits results_<row>.json. A recorded number is
+# evidence of what was measured at the time; replacing it in place would erase the fact
+# that the measurement changed, which is the one thing the run log must not lose.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+APPLY=0; ONLY_GAME=""; ONLY_SUSPECT=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --apply) APPLY=1 ;;
+    --game)  ONLY_GAME="$2"; shift ;;
+    # Only rounds whose recorded note carries the broken test's signature -- a keyboard
+    # verdict of DEAD. Re-grading everything costs ~5 minutes per build and, at 34 rounds,
+    # two and a half hours of serialised browser time for a correction that touches five of
+    # them. A round graded after the fix is already right; re-running it would only add
+    # measurement noise to a number that is not wrong.
+    --only-suspect) ONLY_SUSPECT=1 ;;
+    *) echo "unknown argument: $1" >&2; exit 64 ;;
+  esac; shift
+done
+
+STAMP=$(date +%Y%m%dT%H%M%S)
+printf '%-46s %-12s %-12s %s\n' "run / round" "recorded" "regraded" "note"
+printf '%.0s-' {1..96}; echo
+
+for game_dir in benchmarks/*/; do
+  game=$(basename "$game_dir")
+  [ -n "$ONLY_GAME" ] && [ "$game" != "$ONLY_GAME" ] && continue
+  [ -d "$game_dir/runs" ] || continue
+  for run_dir in "$game_dir"runs/*/; do
+    [ -d "$run_dir" ] || continue
+    out="$run_dir/regrade-$STAMP.json"
+    entries=""
+    for rd in "$run_dir"r*/ "$run_dir"salvage/; do
+      [ -f "$rd/index.html" ] || continue
+      label=$(basename "$rd")
+      if [ "$ONLY_SUSPECT" = 1 ]; then
+        rnd_no=$(printf '%s' "$label" | sed 's/^r//')
+        suspect=$(.venv/bin/python - "$run_dir" "$rnd_no" <<'PYSUS' 2>/dev/null
+import glob, json, os, sys
+run_dir, rnd = sys.argv[1], sys.argv[2]
+rnd = int(rnd) if rnd.isdigit() else None
+hit = "no"
+for f in glob.glob(os.path.join(run_dir, "results_*.json")):
+    try:
+        for r in json.load(open(f)).get("rounds", []):
+            if r.get("round") != rnd:
+                continue
+            note = r.get("ladder_note", "")
+            after = note.split("keys:")[1][:80] if "keys:" in note else ""
+            if "-- DEAD" in after:
+                hit = "yes"
+    except Exception:
+        pass
+print(hit)
+PYSUS
+)
+        [ "$suspect" = "yes" ] || continue
+      fi
+      # Serialised against the live runners: fps is measured in a browser on this machine,
+      # and two graders at once measure each other's CPU contention.
+      res=$(flock /tmp/arena-grader.lock \
+            .venv/bin/python "$game_dir/grader.py" "$rd" --json 2>/dev/null | tail -1)
+      [ -n "$res" ] || continue
+      read -r new_rung new_cap <<<"$(printf '%s' "$res" | .venv/bin/python -c "
+import json,sys
+d=json.load(sys.stdin); c=d.get('capability') or {}
+print(d.get('rung'), f\"{c.get('passed')}/{c.get('total')}\")" 2>/dev/null)"
+      old=$(.venv/bin/python - "$run_dir" "$label" <<'PYEOF' 2>/dev/null
+import glob, json, os, sys
+run_dir, label = sys.argv[1], sys.argv[2]
+rnd = int(label[1:]) if label.startswith("r") and label[1:].isdigit() else None
+for f in glob.glob(os.path.join(run_dir, "results_*.json")):
+    try:
+        for r in json.load(open(f)).get("rounds", []):
+            if r.get("round") == rnd:
+                c = r.get("capability") or {}
+                print(f"{r.get('ladder_rung')} {c.get('passed')}/{c.get('total')}")
+                sys.exit()
+    except Exception:
+        pass
+print("- -")
+PYEOF
+)
+      old_rung=${old%% *}; old_cap=${old##* }
+      note=""
+      [ "$old_rung" != "$new_rung" ] && note="gate $old_rung -> $new_rung"
+      printf '%-46s %-12s %-12s %s\n' \
+        "$(basename "$run_dir")/$label" "$old_rung/6 $old_cap" "$new_rung/6 $new_cap" "$note"
+      entries="$entries{\"label\":\"$label\",\"rung\":$new_rung,\"capability\":\"$new_cap\",\"recorded_rung\":\"$old_rung\"},"
+    done
+    if [ "$APPLY" = 1 ] && [ -n "$entries" ]; then
+      printf '{"regraded_at":"%s","grader":"%s","grader_sha256":"%s","note":"recomputed from the archived build; results_*.json is left untouched","rounds":[%s]}\n' \
+        "$STAMP" "$game_dir/grader.py" "$(sha256sum "$game_dir/grader.py" | cut -c1-16)" "${entries%,}" > "$out"
+    fi
+  done
+done
+echo
+[ "$APPLY" = 1 ] && echo "written: regrade-$STAMP.json in each run directory" \
+                 || echo "dry run -- pass --apply to write regrade-$STAMP.json into each run directory"

@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""bin/arena-watch -- eine Zeile je v3-Lauf; exit 1, wenn eine Zeile stirbt."""
+import glob, json, os, subprocess, sys, time
+G = os.environ.get("ARENA_V3_RUNS") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "benchmarks", "antifa_survivors_v3", "runs")
+# A resumed round's agent part was not observed by this runner (run_game_bench.py's
+# resumed_round()) -- neither ok nor a real failure, so it must not count toward
+# "2x non-ok" nor toward ended_by.
+RESUMED = "not observed (resumed)"
+running = subprocess.run(["pgrep", "-af", "run_game_bench[.]py"], capture_output=True, text=True).stdout
+
+# Process tree (ppid -> [pid], pid -> full cmdline): tells a row waiting in the
+# serial grading queue (runner alive, no agent child) apart from one whose agent
+# has actually gone silent (runner alive, agent child present but quiet).
+AGENT_MARKERS = ("agent-sandbox", "hermes-task", "claude-code-task")
+_ps = subprocess.run(["ps", "-e", "-o", "pid=,ppid=,args="], capture_output=True, text=True).stdout
+_children, _cmd = {}, {}
+for _line in _ps.splitlines():
+    _parts = _line.strip().split(None, 2)
+    if len(_parts) < 3: continue
+    try: _pid, _ppid = int(_parts[0]), int(_parts[1])
+    except ValueError: continue
+    _cmd[_pid] = _parts[2]
+    _children.setdefault(_ppid, []).append(_pid)
+
+def runner_pid(row):
+    # same pattern as the "alive" check below: pgrep -f "run_game_bench[.]py --config <row> "
+    for line in running.splitlines():
+        if f"--config {row} " in line:
+            try: return int(line.split(None, 1)[0])
+            except ValueError: return None
+    return None
+
+def has_live_agent(pid):
+    stack, seen = list(_children.get(pid, [])), set()
+    while stack:
+        p = stack.pop()
+        if p in seen: continue
+        seen.add(p)
+        if any(m in _cmd.get(p, "") for m in AGENT_MARKERS): return True
+        stack.extend(_children.get(p, []))
+    return False
+
+dying = 0
+for d in sorted(glob.glob(os.path.join(G, "*"))):
+    res = glob.glob(os.path.join(d, "results_*.json"))
+    if not res: continue
+    data = json.load(open(res[0])); rows = data.get("rounds", []); row = data.get("config", "?")
+    alive = f"--config {row} " in running
+    last = rows[-1] if rows else {}
+    flags = []
+    if len(rows) >= 2 and all(r.get("exit_meaning") not in ("ok", RESUMED) for r in rows[-2:]): flags.append("2x non-ok")
+    if last.get("ended_by") and last.get("exit_meaning") != RESUMED: flags.append(last["ended_by"])
+    if rows and (last.get("proxy") or {}).get("calls") == 0: flags.append("no proxy calls")
+    if any(r.get("session_fallback") for r in rows): flags.append("session fallback")
+    sc = (last.get("proxy") or {}).get("status_counts") or {}
+    if sc and sc.get("429", 0) > 0.5 * sum(sc.values()): flags.append("429 storm")
+    since = None
+    phase = None
+    if alive:
+        rpid = runner_pid(row)
+        if rpid is not None and has_live_agent(rpid):
+            lp = os.path.join(d, "proxy-requests.jsonl")
+            if os.path.exists(lp):
+                try: since = time.time() - json.loads(open(lp).readlines()[-1])["t"]
+                except Exception: since = None
+            if since is not None and since > 1200: flags.append(f"silent {int(since/60)} min")
+        else:
+            phase = "grading/queued"
+    state = "RUN " if alive else "done"
+    label = "DYING: " + ", ".join(flags) if flags else (phase or "ok")
+    print(f"{state} {row:32s} r{last.get('round', 0)} gate {last.get('ladder_rung', '-')} cap {(last.get('capability') or {}).get('passed', '-')} "
+          f"{last.get('exit_meaning', '-'):16s} {label}")
+    dying += bool(flags)
+sys.exit(1 if dying else 0)

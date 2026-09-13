@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Build the public GitHub Pages tree. Never copies the working repo.
+#
+#   bin/arena-publish [dest]
+#
+# Default dest: ./dist-public
+set -euo pipefail
+cd "$(dirname "$0")/.."
+REPO=$(pwd -P)
+DEST="${1:-$REPO/dist-public}"
+VOTE_REPO="${ARENA_VOTE_REPO:-edrethardo/antifa-survivors-arena}"
+
+rm -rf "$DEST"
+mkdir -p "$DEST"
+ARENA_PUBLIC=1 ARENA_VOTE_REPO="$VOTE_REPO" \
+  .venv/bin/python tools/collect_builds.py "$REPO" "$DEST" "./"
+
+touch "$DEST/.nojekyll"
+cat > "$DEST/README.md" <<'EOF'
+# Antifa Survivors Arena
+
+Public snapshot of the *Antifa Survivors* coding-agent benchmark: graded,
+playable builds plus the written evaluation.
+
+- [Builds](index.html)
+- [Report](bericht.html)
+- [Traces & analytics](analytics.html)
+- [Older runs](archiv.html)
+
+The grader scores the artefact, not the chat. Audience votes use GitHub
+issue 👍 reactions (`[vote] <row>`).
+EOF
+
+.venv/bin/python - "$DEST" <<'PY'
+import os, re, sys
+root = sys.argv[1]
+forbid = re.compile(
+    r"taild[0-9a-z]*\.ts\.net|${HOME}|/home/spheron|arena-work|"
+    r"\bspheron\b|\bdust:6006\b|\bdust\.taild",
+    re.I,
+)
+hits = []
+skip_ext = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".woff", ".woff2", ".ico"}
+for dirpath, dirnames, filenames in os.walk(root):
+    dirnames[:] = [d for d in dirnames if d not in {".git"}]
+    for name in filenames:
+        path = os.path.join(dirpath, name)
+        if os.path.splitext(name)[1].lower() in skip_ext:
+            continue
+        try:
+            text = open(path, encoding="utf-8", errors="ignore").read()
+        except OSError:
+            continue
+        m = forbid.search(text)
+        if m:
+            hits.append(f"{os.path.relpath(path, root)}: {m.group(0)}")
+if hits:
+    print("privacy gate failed:")
+    print("\n".join(hits[:50]))
+    raise SystemExit(1)
+n = 0
+for dirpath, _, filenames in os.walk(root):
+    n += sum(1 for f in filenames if f != ".nojekyll")
+print(f"public tree ok: {n} files in {root}")
+PY

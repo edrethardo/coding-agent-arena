@@ -1,0 +1,11 @@
+{
+  "paste_prior_file": false,
+  "session_mode": "continue",
+  "grade_repeats": 3,
+  "window_s": [
+    180,
+    300
+  ],
+  "grader_sha256": "7f7cef96b9ba0c21",
+  "proxy_required": true
+}

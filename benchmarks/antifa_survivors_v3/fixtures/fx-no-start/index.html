@@ -1,0 +1,88 @@
+<!doctype html><html><head><meta charset="utf-8"><title>fx</title>
+<style>html,body{margin:0;background:#111}canvas{display:block;touch-action:none}</style></head><body><canvas id="c"></canvas>
+<script>window.FX = {input: 'touch', frozen: false, fakeVictory: false, slowDraw: false, silent: false, noTitle: false, noStart: true, busyAfterEnd: false, scalarState: false};</script>
+<script>
+const FX = window.FX;
+const q = new URLSearchParams(location.search);
+const autoplay = q.get('autoplay') === '1';
+const c = document.getElementById('c'); const g = c.getContext('2d');
+c.width = 500; c.height = 800;
+const S = { mode: FX.noTitle ? 'running' : 'title', alive: true, kills: 0, level: 1, elapsed: 0,
+  weapons: FX.scalarState ? 1 : ['Baseball bat'], enemies: 0, player: { x: 250, y: 400 }, autoplay: autoplay,
+  audio: { playing: false, muted: false }, passives: [], evolutions: [], bystanders: 0,
+  nipsters: FX.scalarState ? 0 : { hidden: 0, revealed: 0 },
+  bosses: FX.scalarState ? 0 : { spawned: 0, defeated: 0 }, stage: 1, ended: false };
+window.__state = S;
+let vx = 0, vy = 0, keys = {}, joy = null, t0 = performance.now(), lastDraw = 0, tick = 0;
+let ac = null;
+function startAudio() {
+  if (FX.silent || ac) return;
+  ac = new AudioContext();
+  const o = ac.createOscillator(), ws = ac.createWaveShaper(), gn = ac.createGain();
+  ws.curve = new Float32Array([-1, 0, 1]); gn.gain.value = 0.02;
+  o.connect(ws); ws.connect(gn); gn.connect(ac.destination); if (!FX.noStart) o.start(); ac.resume();
+  S.audio.playing = true;
+}
+function start() { if (S.mode === 'title') { S.mode = 'running'; t0 = performance.now(); } startAudio(); }
+if (autoplay) setTimeout(start, 300);
+// Gated on autoplay, not just on being loaded at all: title_and_start() and input_session()
+// each load this same page WITHOUT ?autoplay=1 first, and each keeps it open for several
+// real seconds before navigating away again -- if the busy loop could fire on any of those
+// earlier loads, it would freeze a phase the grader does not (and round 3 specifically must
+// not have to) protect with a per-command timeout, well before play_session ever starts
+// sampling. Scoping it to autoplay ensures it only ever fires on play_session's own load.
+if (autoplay && FX.busyAfterEnd) setTimeout(() => { while (true) {} }, 15000);
+addEventListener('keydown', e => { keys[e.key.toLowerCase()] = true; if (e.key === 'Enter' || e.key === ' ') start(); });
+addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+const joyStart = (x, y) => { joy = { x0: x, y0: y, x, y }; start(); };
+const joyMove = (x, y) => { if (joy) { joy.x = x; joy.y = y; } };
+const joyEnd = () => { joy = null; };
+if (FX.input === 'touch') {
+  c.addEventListener('touchstart', e => { const t = e.touches[0]; joyStart(t.clientX, t.clientY); e.preventDefault(); }, { passive: false });
+  c.addEventListener('touchmove', e => { const t = e.touches[0]; joyMove(t.clientX, t.clientY); e.preventDefault(); }, { passive: false });
+  c.addEventListener('touchend', joyEnd);
+} else if (FX.input === 'pointer') {
+  c.addEventListener('pointerdown', e => joyStart(e.clientX, e.clientY));
+  c.addEventListener('pointermove', e => joyMove(e.clientX, e.clientY));
+  c.addEventListener('pointerup', joyEnd);
+} else {
+  c.addEventListener('mousedown', e => joyStart(e.clientX, e.clientY));
+  c.addEventListener('mousemove', e => joyMove(e.clientX, e.clientY));
+  c.addEventListener('mouseup', joyEnd);
+}
+function step(dt) {
+  if (S.mode !== 'running') return;
+  S.elapsed = (performance.now() - t0) / 1000;
+  vx = (keys['d'] || keys['arrowright'] ? 1 : 0) - (keys['a'] || keys['arrowleft'] ? 1 : 0);
+  vy = (keys['s'] || keys['arrowdown'] ? 1 : 0) - (keys['w'] || keys['arrowup'] ? 1 : 0);
+  if (joy) { vx += (joy.x - joy.x0) / 40; vy += (joy.y - joy.y0) / 40; }
+  if (autoplay) { vx = Math.sin(S.elapsed); vy = Math.cos(S.elapsed * 0.7); }
+  S.player.x += vx * 200 * dt; S.player.y += vy * 200 * dt;
+  S.enemies = 5;
+  tick++;
+  if (tick % 30 === 0 && (!FX.frozen || S.elapsed > 8)) { S.kills++; if (S.kills % 5 === 0) S.level++; }
+  if (FX.fakeVictory && S.elapsed > 5) S.ended = 'victory';
+}
+function draw() {
+  g.fillStyle = '#111'; g.fillRect(0, 0, c.width, c.height);
+  if (S.mode === 'title') {
+    g.fillStyle = '#e0202f'; g.fillRect(40, 200, 420, 300);
+    g.fillStyle = '#000'; g.font = 'bold 40px sans-serif'; g.fillText('ANTIFA SURVIVORS', 60, 360);
+    g.strokeStyle = '#fff'; g.lineWidth = 8;
+    for (let i = 0; i < 3; i++) { g.beginPath(); g.moveTo(300 + i * 30, 420); g.lineTo(230 + i * 30, 490); g.stroke(); }
+    return;
+  }
+  g.fillStyle = '#e0202f'; g.fillRect(S.player.x - 10, S.player.y - 10, 20, 20);
+  g.fillStyle = '#3a6fd8'; for (let i = 0; i < 5; i++) g.fillRect(50 + i * 80, 100 + (tick % 60), 14, 14);
+  g.fillStyle = '#fff'; g.fillText('kills ' + S.kills, 10, 30);
+}
+let last = performance.now();
+(function loop(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  step(dt);
+  if (FX.frozen) { if (S.mode === 'title' || S.elapsed < 8) draw(); }   // animiert, friert dann ein; kills steigen erst danach
+  else if (FX.slowDraw) { if (now - lastDraw > 100) { draw(); lastDraw = now; } }
+  else draw();
+  requestAnimationFrame(loop);
+})(performance.now());
+</script></body></html>

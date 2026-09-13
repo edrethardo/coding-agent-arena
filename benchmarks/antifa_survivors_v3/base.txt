@@ -1,0 +1,238 @@
+Build a Vampire Survivors-style browser game called "Antifa Survivors".
+
+TARGET: iPhone Safari in portrait AND desktop browsers, no install step. Served as static
+files over a LAN, so it must run from a plain file server: no build tooling, no network
+fetches at runtime, no CDN. No image files, no audio files -- draw with canvas primitives,
+make sound with the WebAudio API.
+
+HOW TO DELIVER: your files live in the current working directory. `index.html` is the
+required entry point; you MAY split the game into several files (`*.js`, `*.css`) loaded by
+relative path from index.html. Read what you need, change what the round asks for, and keep
+every earlier round working. Do NOT print the game to the chat -- the files on disk are the
+deliverable, and only they are graded.
+
+THIS IS AN ITERATIVE BUILD IN ONE CONVERSATION. After this first request you will receive
+follow-up requests in this same session, one per round; each adds to what you already wrote.
+Keep weapons, enemies, passives and upgrades as DATA (arrays of plain objects) driving generic
+systems, never as hardcoded special cases -- later rounds add many more of each.
+
+NEVER REGRESS. Every round must leave the game loading and playable.
+
+
+--- HOW YOU ARE SCORED ---
+
+An automated checker plays the game for a few minutes with keyboard and touch and reads
+`window.__state`. It scores how much of the specification is demonstrably running. It never
+reads your source, your chat, or your explanation. Reporting state your game does not
+actually have is the one way to fail this benchmark outright.
+
+
+--- THE STATE CONTRACT (required, every round) ---
+
+Expose a read-only snapshot of your own state, updated every frame:
+
+    window.__state = {
+      mode:       "title" | "running" | "ended",
+      alive:      <bool>,
+      kills:      <int>,
+      level:      <int>,      // starts at 1
+      elapsed:    <float>,    // seconds since the run started
+      weapons:    <string[]>, // names of owned weapons
+      enemies:    <int>,      // hostile entities currently on screen
+      player:     { x: <float>, y: <float> },
+      autoplay:   <bool>,     // is the autoplay policy currently driving
+      audio:      { playing: <bool>, muted: <bool> },
+
+      // add each of these in the round that introduces the feature:
+      passives:   <string[]>,
+      evolutions: <string[]>,
+      bystanders: <int>,
+      nipsters:   { hidden: <int>, revealed: <int> },
+      bosses:     { spawned: <int>, defeated: <int> },
+      stage:      <int>,      // 1-based district index
+      ended:      false | "victory" | "death"
+    }
+
+A field for a feature you have not built yet may be absent or zero. Every field that is
+present must reflect what is actually on screen and what the player actually owns.
+
+
+--- TITLE SCREEN, START, AUTOPLAY (required, every round) ---
+
+Plain `index.html` shows a TITLE SCREEN drawn on the canvas: the game's name and
+antifascist imagery drawn with canvas primitives -- three arrows pointing down-left, two
+flags, black and red, the look of a sticker. `__state.mode` is "title" there. A run starts
+on a key press (Enter or Space) AND on a touch/tap anywhere on the canvas; then
+`__state.mode` becomes "running".
+
+    index.html?autoplay=1   draws the title screen, then starts a run by itself within 1 s
+                            with the autoplay policy driving; __state.autoplay true
+    index.html?autoplay=0   title screen, then the run starts under player control on
+                            key or touch;                     __state.autoplay false
+
+Autoplay is a scripted policy, not anything learned: kite away from the nearest cluster,
+prioritise ranged enemies, pick upgrades from a weight table. It has to run unattended long
+enough to be measured.
+
+Input works BOTH ways in one build, chosen at runtime: WASD and arrow keys on desktop,
+a virtual joystick (drag anywhere on the canvas) on touch. The checker drives real
+keyboard and pointer input the way a device would.
+
+
+--- SOUNDTRACK (from round 2) ---
+
+A procedural PUNK ROCK soundtrack via the WebAudio API: oscillator bass, noise drums,
+distortion through a WaveShaperNode, 170-200 bpm. It plays on the title screen and during
+the run, reacts to the game (boss, level-up, death), and can be muted (key M and a touch
+button). Browsers block audio until the first user gesture -- start the AudioContext on
+the first key/touch, and under ?autoplay=1 start it as soon as the browser allows.
+
+
+--- FULL DESIGN SPEC (the whole target; each round below implements a slice) ---
+## 1. Protagonist
+
+A masked black-bloc antifascist — hoodie, scarf, the movement's own visual language.
+Single character at v1; alternates are a stretch goal and not scored.
+
+## 2. Weapons — twelve, mapped onto Vampire Survivors' function families
+
+VS weapons are distinct by *function*, not by damage numbers: something orbits, something
+auras, something auto-targets, something drops a zone, something boomerangs, something
+strikes at random. Each family is a different piece of code. The iconography maps onto
+those families rather than replacing them.
+
+All twelve auto-fire on cooldown — no aiming, genre standard — and level 1→8.
+
+| weapon | VS family | function |
+|---|---|---|
+| **Baseball bat** | Whip | melee arc in the facing direction, knockback, short cooldown. **Starting weapon.** |
+| **Brick** | Magic Wand | auto-targets the nearest enemy, thrown projectile, reliable |
+| **Molotov cocktail** | Santa Water / Fire Wand | thrown in an arc, shatters into a burning pool that damages over time |
+| **Chain** | Cross | thrown out and returns, pierces everything on both legs |
+| **Banner** | King Bible | orbits the player, sweeps and knocks back — defensive |
+| **Megaphone** | Garlic | constant damaging aura around the player, repels and staggers |
+| **Paint bomb** | Santa Water | drops splatter zones at random nearby positions — slow + accuracy debuff |
+| **Smoke grenade** | — | defensive zone; enemies inside lose targeting |
+| **Flare** | Lightning Ring | strikes random enemies anywhere on screen |
+| **Sound system** | aura buff | radius aura: cooldown reduction for the player and any allies in it |
+| **Solidarity bloc** | Peachone / familiar | summons allied figures that fight on their own; damage scales with how many live |
+| **Flyer drop** | passive proc | low chance to convert a weak enemy into an ally |
+
+## 2b. Passives — six
+
+Genre-standard modifiers, because in VS the passives are half the build.
+
+| passive | effect |
+|---|---|
+| Steel toecaps | +damage |
+| Running shoes | +move speed |
+| Black bloc mask | +armour, enemies acquire you more slowly |
+| Affinity group | +1 projectile amount |
+| Adrenaline | −cooldown |
+| Spray paint | +area size |
+
+## 2c. Evolutions — five
+
+Max the weapon, hold the passive, collect a chest: the weapon evolves. This is the single
+most implementation-heavy mechanic in the genre — it needs level tracking, an inventory
+precondition check, a pickup trigger and a replacement weapon with new behaviour — and it
+is where a weak agent's build will fall apart. Worth including for exactly that reason.
+
+| weapon + passive | evolves into |
+|---|---|
+| Baseball bat + Steel toecaps | **Sweep** — wide arc, stuns |
+| Molotov + Spray paint | **Firewall** — a burning line rather than a pool |
+| Banner + Affinity group | **Bloc formation** — several banners orbiting at once |
+| Megaphone + Adrenaline | **Sound cannon** — much larger aura, hard stagger |
+| Solidarity bloc + Black bloc mask | **Mass mobilisation** — allies stop expiring |
+
+**Solidarity bloc is still the centre.** Allies need independent targeting, lifetime and
+collision, its evolution changes their lifetime rule, and Sound system and Flyer drop both
+feed it — so the three form a real build path instead of three isolated pickups. It stays
+the weapon most likely to separate a strong agent from a weak one.
+
+## 3. Enemies — archetypes, deliberately not portraits
+
+Six types plus a boss, built as **generic far-right archetypes** rather than resembling
+members of any specific current party:
+
+| enemy | mechanic |
+|---|---|
+| Torchbearer | slow melee, marches in formation |
+| **Skinhead goon** | the baseline mob — bomber jacket and boots, fast brawler that charges; most numerous by far, and the wave-density dial the whole difficulty curve is tuned on |
+| Suit | tanky, buffs nearby enemies, no attack of its own |
+| Troll | tiny, fast, spawns in swarms |
+| Propagandist | ranged, projectiles apply a debuff |
+| **Nipster** | spawns *disguised* among the neutral crowd and is indistinguishable until it acts; fast once revealed, and converts idle bystanders into enemies if left alone |
+| Kettle | blockade that constrains player movement |
+| **Boss — "Der Redner"** | demagogue at a podium; spawns waves while speaking, destroying the amplification halts the spawns |
+| **Boss — "Die Funktionärin"** | second podium boss; a party-functionary archetype who coordinates rather than shouts — buffs and repositions the wave instead of spawning it |
+
+**Design decision, stated so it does not get quietly reversed.** Aaron asked for enemies
+resembling typical current German far-right party members, without any specific person's
+likeness. I have taken the second half further and made them archetypal rather than
+party-identifiable, for three reasons:
+
+1. **It does not survive the medium anyway.** These are sprites in a wave shooter. Party-
+   specific likeness is illegible at that scale; the archetype is what actually reads.
+2. **This run is going on LinkedIn.** Depicting the identifiable membership of a living,
+   currently-contesting political party as the things the player kills is an exposure —
+   professional and legal — attached to Aaron's own name and to a company he intends to
+   tag. Archetypes carry the same meaning without it.
+3. **It matches the movement's own iconography.** The Alerta Liège sticker is exactly this:
+   a masked figure and a generic adversary. The visual language antifascism uses about
+   itself is archetypal, not caricature of named politicians.
+
+**Faction colour: party blue.** The enemy faction wears the blue of the German far-right
+party, and the suited types are blue-suited. Depicting a real party as the antagonist
+organisation is ordinary political expression — that is what the game is *about*, and
+softening it would make it dishonest.
+
+What stays off the table is the two individuals currently leading it. Two podium bosses
+rather than one, deliberately differing in sex and age so the roster is
+not implicitly all-male — which is both better design and truer to what the far right
+actually looks like. They are **not** styled to the identifying features of the pair
+currently leading any specific party (no blonde-ponytail / grey-haired matched duo). A game
+in which the player kills two recognisable living politicians is a different object from a
+game in which the player fights fascists, and only the second one is what this is.
+
+The symbols do the work regardless: a demagogue amplified at a podium, a functionary who
+coordinates without ever raising their voice, torchlight marches, the suited respectable
+face. Nothing about the game's politics is softened by this — the machinery is the sharper
+target than two faces that get replaced at the next party conference. Only the liability
+goes away.
+
+### Why the Nipster is the best enemy in the roster
+
+Mechanically it is the hardest thing in the spec, which is exactly what a benchmark wants.
+It requires a **neutral bystander entity class** that does not otherwise exist, a hidden/
+revealed state per instance, distinct rendering per state, and an autoplay policy that has
+to cope with not knowing which entity is hostile. Most agents will implement the other six
+enemies as one loop with different constants; this one cannot be faked that way, so it is
+where the rows separate.
+
+It is also the design's cleanest symmetry. Flyer drop converts enemies into allies; the
+Nipster converts bystanders into enemies. Same mechanic, opposite direction — recruitment
+against recruitment, which is what the two movements actually do to the uncommitted, and
+the nipster phenomenon (far-right entryism through subcultural aesthetics rather than
+open confrontation) is precisely the camouflage mechanic made literal.
+
+## 4. Progression
+
+Waves with rising density; XP from kills; a level-up that offers three upgrades and takes
+one (genre standard); districts as stages; a defined ending — a run must be *completable*,
+because the run has to be completable.
+
+## 5. Autoplay
+
+A scripted policy, not anything learned: kite away from the nearest cluster, prioritise
+ranged enemies, pick upgrades from a weight table. It must run unattended long enough to
+be measured, because autoplay is what makes this benchmark scale to five agents without
+five times the human attention.
+
+## 6. Data-driven, like the parent engine
+
+Weapons, enemies and upgrades declared in JSON, mirroring DungeonEngine's
+`assets/config/` approach, so the "large declared-data file already in context" property
+carries over from the dungeon clone. The configs double as the correctness oracle: damage,
+scaling and drop rules are checkable against declared values rather than judged by eye.

@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# Hermes Agent harness for the agentic arena tier-3 comparison.
+#
+# Contract (must match bin/dsh-task / bin/opencode-task exactly):
+#   <wrapper> <target-dir> < task.txt
+#     stdin          : the task prompt
+#     stdout         : final assistant text ONLY (the "answer" the judge sees)
+#     exit 0 / 3     : ok / timeout
+#     exit 4 / 5     : harness / model failure
+#
+# The task file instructs the agent to write solution.py into its current
+# working directory. Hermes' terminal tool pins its working directory from the
+# TERMINAL_CWD env var (read in hermes_constants / session_workdir), so we set
+# that to the target dir here. This is the Hermes equivalent of dsh's --cwd
+# and opencode's --dir: the only harness-level accommodation.
+#
+#   --query-file -   read the single query from stdin (safe: nothing is
+#                    shell-interpreted). Consumed before we touch the streams.
+#   --oneshot -Q     answer the query and print ONLY the final response to
+#                    stdout; the session id and all diagnostics go to stderr,
+#                    which we throw away so stdout stays clean answer text.
+#   --yolo           non-interactive one-shot: dangerous-command approval must
+#                    not block, so auto-approve.
+#   --profile        pinned for reproducibility regardless of the invoking
+#                    shell's profile state.
+set -u
+
+TARGET_DIR="${1:?usage: hermes-task <target-dir> < task.txt}"
+HERMES_BIN="${HERMES_BIN:-hermes}"
+
+export TERMINAL_CWD="$TARGET_DIR"
+
+# Eine Sitzung ueber alle Runden (v3, Spec 2.5): der Runner gibt den Sitzungsnamen; Hermes legt
+# ihn in Runde 1 an und setzt ihn danach fort. Ohne ARENA_SESSION_NAME (v2) bleibt alles wie es war.
+# --create-if-missing ONLY in round 1 (ARENA_SESSION_CONTINUE=0) or after a fallback.
+# Passing it in every round hid the failure this benchmark is meant to measure: a session
+# lost between rounds was silently RE-CREATED, hermes exited 0, and the follow-up-only
+# prompt ("ROUND 4 of 7 -- ...") ran against an empty context with no spec behind it. The
+# round was then recorded as ok with session_continued true. Without the flag hermes says
+# "No session found matching '<name>'" and exits 1, which is mapped to exit 9 below so the
+# runner takes its one fresh-session fallback and MARKS the round (spec 2.5).
+SESSION_ARGS=()
+if [ -n "${ARENA_SESSION_NAME:-}" ]; then
+  SESSION_ARGS=(--continue "$ARENA_SESSION_NAME" --no-restore-cwd)
+  [ "${ARENA_SESSION_CONTINUE:-0}" = 1 ] || SESSION_ARGS+=(--create-if-missing)
+fi
+
+# Opt-in experiment: keep tool reads and verification summaries small so a
+# growing build does not consume the context budget before it can be edited.
+HYGIENE_ARGS=()
+if [ "${ARENA_AGENT_OUTPUT_HYGIENE:-0}" = "1" ]; then
+  HYGIENE_ARGS=(--append-system-prompt "For this build task: inspect files in small targeted ranges; never dump a whole large file or raw browser log into chat; keep verification summaries concise; do not install npm dependencies in the work directory. Spend output on editing and testing the artifact.")
+fi
+
+# stdout = final answer (kept); stderr = session id + diagnostics (kept only long enough to
+# tell a lost session apart from a harness failure, then discarded).
+ERR=$(mktemp)
+"$HERMES_BIN" chat \
+  "${SESSION_ARGS[@]}" \
+  "${HYGIENE_ARGS[@]}" \
+  --profile "${HERMES_PROFILE:-default}" \
+  --query-file - \
+  --oneshot -Q --yolo \
+  2>"$ERR"
+rc=$?
+# Probed 2026-09-10 against ~/.hermes-arena/v3-stock (proxy port 8011 down, so no model call
+# could have succeeded): `hermes chat --continue no-such-session-xyz` without
+# --create-if-missing exits 1 and prints to stderr
+#   "No session found matching 'no-such-session-xyz'."
+#   "Use 'hermes sessions list' to see available sessions, or pass --create-if-missing ..."
+# Match that phrasing only -- not any stderr that merely mentions "session" -- so a model
+# error about a session limit stays exit 8 (recorded) instead of triggering a false fallback.
+if [ "$rc" -ne 0 ] && [ "${ARENA_SESSION_CONTINUE:-0}" = 1 ] \
+   && grep -qiE "no session found matching|session (id )?(not found|does not exist)" "$ERR"; then
+  rm -f "$ERR"; exit 9
+fi
+rm -f "$ERR"
+
+case $rc in
+  0)     exit 0 ;;
+  124|142) exit 3 ;;   # timeout (if a caller wraps us in `timeout`)
+  # 8, not 4: the runner treats 4 as "the endpoint is gone" and stops the WHOLE run.
+  # A bad config or a spawn error is a failure of this round, not evidence that the model
+  # host died, and mapping it to 4 threw away every remaining round of a seven-round run
+  # for a fault that a retry would have survived. Measured cost of the conflation: a
+  # harness hiccup in round 4 loses rounds 5-7 and reads in the record as a dead endpoint.
+  1)     exit 8 ;;     # harness-level failure (bad config, spawn error)
+  *)     exit 5 ;;     # model / runtime failure
+esac

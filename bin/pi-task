@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Pi Agent Harness (earendil-works/pi) for the arena. Third harness on the same local model.
+#
+#   bin/pi-task <target-dir> < task.txt
+#
+# Same contract as bin/hermes-task / bin/dsh-task / bin/opencode-task:
+#   stdin  the task · stdout the final assistant text ONLY
+#   exit 0 ok | 3 timeout | 4 endpoint/config unusable | 5 model failure | 8 harness failure
+#
+# The task goes in a FILE referenced as `@file`, never in argv. Only the path reaches the
+# command line, so the 128 KB single-argument limit (MAX_ARG_STRLEN) cannot truncate a
+# round -- the composed prompt is already 41 KB at round 2 and grows with every round.
+# This is the same lesson bin/dsh-task-model records for dsh.
+#
+# The task file lives INSIDE the target directory because that is the only tree the agent
+# can see (bin/agent-sandbox masks everything else), and it is removed afterwards so it
+# cannot become part of the next round's input or of the graded artefact.
+#
+# Pi ships no permission system: upstream states it runs with the full rights of the
+# invoking user and recommends containerisation. In this arena that is handled one level
+# up -- run_game_bench launches every row through bin/agent-sandbox, which hides the
+# grader, both repo checkouts and the other rows' builds. Do not run this wrapper outside
+# that sandbox.
+set -uo pipefail
+
+TARGET_DIR="${1:?usage: pi-task <target-dir> < task.txt}"
+[ -d "$TARGET_DIR" ] || { echo "pi-task: no such directory: $TARGET_DIR" >&2; exit 3; }
+
+PI_BIN="${PI_BIN:-pi}"
+[ -x "$PI_BIN" ] || { echo "pi-task: pi not found at $PI_BIN" >&2; exit 4; }
+PROVIDER="${PI_PROVIDER:-vllm}"
+MODEL="${PI_MODEL:-Qwen3.8-27B-Instruct}"
+
+# Pi's default provider is `google`; without --provider it would silently talk to the
+# wrong endpoint, or fail for a reason that reads like a model problem.
+cd "$TARGET_DIR" || exit 3
+TASKFILE="$TARGET_DIR/.pi-task-$$.md"
+cleanup() { rm -f "$TASKFILE"; }
+trap cleanup EXIT
+cat > "$TASKFILE"
+[ -s "$TASKFILE" ] || { echo "pi-task: empty task on stdin" >&2; exit 4; }
+
+"$PI_BIN" --print --no-session --provider "$PROVIDER" --model "$MODEL" \
+          -- "@$TASKFILE"
+rc=$?
+
+case $rc in
+  0)       exit 0 ;;
+  124|142) exit 3 ;;
+  1)       exit 8 ;;   # harness failure: recorded, does not stop the run
+  *)       exit 5 ;;
+esac

@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# Hermes harness with the model chosen by environment, instead of the config default.
+#
+#   HERMES_PROVIDER=anthropic HERMES_MODEL=claude-sonnet-5 \
+#     bin/hermes-task-model <target-dir> < task.txt
+#
+# Same contract as bin/hermes-task / bin/dsh-task / bin/opencode-task, byte for byte:
+#   stdin  the task · stdout the final assistant text ONLY
+#   exit 0 ok | 3 timeout | 4 endpoint/credentials unusable | 5 model failure
+#   exit 8 harness-level failure -- NOT run-stopping (see bin/hermes-task)
+#
+# Why a second file instead of a flag on bin/hermes-task: that wrapper is the pinned
+# hermes-qwen row, and run G's numbers refer to it exactly as it stands. A row's wrapper
+# is part of what a published number means, so the Claude rows get their own file rather
+# than a mutation of the one that has already produced results. This mirrors
+# bin/dsh-task-model, which exists for the same reason.
+#
+# --provider and -m are TOP-LEVEL hermes flags and must come BEFORE the `chat` subcommand;
+# after it they are parsed as chat arguments and silently ignored, which would run the
+# config default (the local Qwen) while the record claimed a Claude model.
+set -u
+
+TARGET_DIR="${1:?usage: hermes-task-model <target-dir> < task.txt}"
+HERMES_BIN="${HERMES_BIN:-hermes}"
+PROVIDER="${HERMES_PROVIDER:?HERMES_PROVIDER is required (e.g. anthropic)}"
+MODEL="${HERMES_MODEL:?HERMES_MODEL is required (e.g. claude-sonnet-5)}"
+
+export TERMINAL_CWD="$TARGET_DIR"
+
+# Refuse up front if the provider has no usable credential. Without this the run dies
+# per-request deep inside the agent loop and the record cannot tell a missing login from a
+# model that answered badly -- the same class of failure bin/dsh-task-model guards against
+# with its OPENROUTER_API_KEY check.
+# Test FOR the phrase, not "some line lacks it": `grep -qv "logged out"` succeeded as soon
+# as ANY line of the output did not contain it -- a header, a blank line, the name of a
+# second provider -- so a logged-out provider passed this gate and the round then died
+# per-request deep inside the agent loop, which is the failure this check exists to
+# prevent. No output at all is a failure too: a hermes that cannot run says nothing.
+AUTH_OUT=$("$HERMES_BIN" auth status "$PROVIDER" 2>/dev/null)
+if [ -z "$AUTH_OUT" ] || printf '%s' "$AUTH_OUT" | grep -qi "logged out"; then
+  echo "hermes-task-model: provider '$PROVIDER' is logged out -- run 'hermes auth add $PROVIDER'" >&2
+  exit 4
+fi
+
+# Eine Sitzung ueber alle Runden (v3, Spec 2.5): der Runner gibt den Sitzungsnamen; Hermes legt
+# ihn in Runde 1 an und setzt ihn danach fort. Ohne ARENA_SESSION_NAME (v2) bleibt alles wie es war.
+# --create-if-missing ONLY in round 1 (ARENA_SESSION_CONTINUE=0) or after a fallback.
+# Passing it in every round hid the failure this benchmark is meant to measure: a session
+# lost between rounds was silently RE-CREATED, hermes exited 0, and the follow-up-only
+# prompt ("ROUND 4 of 7 -- ...") ran against an empty context with no spec behind it. The
+# round was then recorded as ok with session_continued true. Without the flag hermes says
+# "No session found matching '<name>'" and exits 1, which is mapped to exit 9 below so the
+# runner takes its one fresh-session fallback and MARKS the round (spec 2.5).
+SESSION_ARGS=()
+if [ -n "${ARENA_SESSION_NAME:-}" ]; then
+  SESSION_ARGS=(--continue "$ARENA_SESSION_NAME" --no-restore-cwd)
+  [ "${ARENA_SESSION_CONTINUE:-0}" = 1 ] || SESSION_ARGS+=(--create-if-missing)
+fi
+
+ERR=$(mktemp)
+"$HERMES_BIN" --provider "$PROVIDER" -m "$MODEL" \
+  chat "${SESSION_ARGS[@]}" \
+       --profile "${HERMES_PROFILE:-default}" \
+       --query-file - \
+       --oneshot -Q --yolo \
+  2>"$ERR"
+rc=$?
+# Same not-found mapping as bin/hermes-task (phrasing probed there, 2026-09-10).
+if [ "$rc" -ne 0 ] && [ "${ARENA_SESSION_CONTINUE:-0}" = 1 ] \
+   && grep -qiE "no session found matching|session (id )?(not found|does not exist)" "$ERR"; then
+  rm -f "$ERR"; exit 9
+fi
+rm -f "$ERR"
+
+case $rc in
+  0)       exit 0 ;;
+  124|142) exit 3 ;;
+  1)       exit 8 ;;   # harness failure: recorded, does not stop the run
+  *)       exit 5 ;;
+esac

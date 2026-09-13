@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# VERBATIM COPY of ~/.local/bin/dsh-task with ONE change: the Claude overlay is chosen by
+# $DSH_MODEL_OVERLAY instead of being hard-coded, so a model can be A/B-compared without
+# editing ~/.dsh/claude-backend.yml -- a file a shared ticket-board dispatcher also reads.
+#
+# Everything else is untouched on purpose: the node PATH, HOME, the task file living
+# inside the target tree, the .git/info/exclude line and the child reaping are all
+# load-bearing details that were paid for elsewhere.
+#
+# Run ONE task through the DeepSeek Harness against the local model.
+#
+#   dsh-task <target-dir> < task.txt
+#
+# Same contract as opencode-task, deliberately: the board encodes it.
+#   STDIN   the task, verbatim UTF-8, no size ceiling
+#   STDOUT  the final assistant text and NOTHING else
+#   STDERR  `dsh-task: model=<id> dir=<path>`, plus errors
+#   exit 0 ok | 3 bad dir | 4 endpoint unreachable | 5 ran but produced no text
+#   7 backend configured but its credentials are missing (misconfiguration, not network)
+#
+# Env: DSH_TASK_WAKE_TIMEOUT (default 360s).
+set -uo pipefail
+
+DSH=dsh
+WAKE=wake-vllm
+ENDPOINT=http://127.0.0.1:8000/v1
+PROFILE=headless
+WAKE_TIMEOUT=${DSH_TASK_WAKE_TIMEOUT:-360}
+# DSH_TASK_BACKEND=claude routes the run to the local `claude` CLI (subscription
+# auth stays inside that CLI). Default is the local vLLM model. Additive env
+# switch: argv order, exit codes and the stdout contract are unchanged.
+BACKEND=${DSH_TASK_BACKEND:-local}
+PATCH_ARGS=()
+if [ "$BACKEND" = "claude" ]; then
+  PATCH_ARGS=(--patch "${DSH_MODEL_OVERLAY:-${HOME}/.dsh/claude-backend.yml}")
+elif [ "$BACKEND" = "openrouter" ]; then
+  # DSH_TASK_BACKEND=openrouter: OpenRouter's stealth model (see the overlay).
+  # A missing key would fail every request as MISSING_CREDENTIAL, which reads
+  # like the model failing — refuse up front. Exit 7, not 4: a missing key is
+  # a misconfiguration, and a caller must be able to tell it from a box that
+  # is off (6 is taken by examples/dsh-task for "backend not implemented").
+  [ -n "${OPENROUTER_API_KEY:-}" ] || { echo "dsh-task: backend=openrouter but OPENROUTER_API_KEY is not set" >&2; exit 7; }
+  PATCH_ARGS=(--patch ${HOME}/.dsh/openrouter-backend.yml)
+fi
+
+TARGET_DIR=${1:?usage: dsh-task <target-dir> < task.txt}
+[ -d "$TARGET_DIR" ] || { echo "dsh-task: no such directory: $TARGET_DIR" >&2; exit 3; }
+
+# --- wake (local backend only — a Claude run never touches the vLLM box) ---
+if [ "$BACKEND" = "claude" ]; then
+  echo "dsh-task: backend=claude (local claude CLI)" >&2
+elif [ "$BACKEND" = "openrouter" ]; then
+  echo "dsh-task: backend=openrouter (stealth/ox-alpha)" >&2
+else
+"$WAKE" --check >/dev/null 2>&1; rc=$?
+case "$rc" in
+  0) ;;
+  2) echo "dsh-task: engine idle-stopped; the socket starts it on first use" >&2 ;;
+  *) echo "dsh-task: box not listening, waking (up to ${WAKE_TIMEOUT}s)…" >&2
+     "$WAKE" --timeout "$WAKE_TIMEOUT" >&2 2>&1 || {
+       echo "dsh-task: endpoint unreachable — box off or WoL did not take" >&2; exit 4; } ;;
+esac
+
+# --- the model the endpoint ACTUALLY serves --------------------------------
+SERVED=""; deadline=$(( $(date +%s) + WAKE_TIMEOUT ))
+while [ -z "$SERVED" ] && [ "$(date +%s)" -lt "$deadline" ]; do
+  SERVED=$(curl -s --max-time 30 "$ENDPOINT/models" \
+           | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])' 2>/dev/null)
+  [ -n "$SERVED" ] || sleep 5
+done
+[ -n "$SERVED" ] || { echo "dsh-task: endpoint open but served no model in ${WAKE_TIMEOUT}s" >&2; exit 4; }
+echo "dsh-task: model=$SERVED dir=$TARGET_DIR" >&2
+fi
+
+# pi-ai refuses a route with no key reference; vLLM ignores the value.
+export VLLM_API_KEY="${VLLM_API_KEY:-local}"
+# dsh resolves its profiles under $HOME/.dsh. A systemd unit may pass no HOME
+# at all, and dsh then fails with "loader entries failed to apply" — which
+# reads like a broken profile, not a missing variable.
+export HOME="${HOME:-${HOME}}"
+# dsh needs node on PATH for plugin resolution; a unit may pass none.
+# PREPEND, never append: under `env -i` bash still supplies a default PATH, and
+# /usr/bin/node is the apt Node 20. dsh needs ^22.19 and fails with an opaque
+# "failed to apply loader entry include" — a version error wearing a
+# configuration error's clothes.
+# Correction 2026-09-09: that pinned Node 22 tree VANISHED together with dsh itself, so
+# this line silently prepended a directory that did not exist. Both remaining
+# interpreters now satisfy the requirement anyway (/usr/bin/node v24.20.0,
+# ~/.local/bin/node v26.8.1), so prepend the one verified to run dsh and fall back
+# rather than dangle.
+DSH_NODE_BIN="${DSH_NODE_BIN:-${HOME}/.local/bin}"
+[ -x "$DSH_NODE_BIN/node" ] || DSH_NODE_BIN=/usr/bin
+export PATH="$DSH_NODE_BIN:${PATH:-/usr/bin:/bin}"
+# The claude backend shells out to the `claude` CLI BY NAME, and that lives in
+# ~/.local/bin — which a systemd unit does not put on PATH. Measured 2026-08-25:
+# a board-dispatched `backend: claude` run died with
+#   dsh: CLI_NOT_FOUND: The `claude` executable was not found.
+# exit 1, empty stdout, so the board recorded "keine Ausgabe" and the gate went
+# green on an untouched tree. Same class as the node line above: this launcher
+# does not trust the caller's environment, it states what it needs.
+export PATH="${HOME}/.local/bin:${PATH}"
+
+# --- run -------------------------------------------------------------------
+# The task goes in a FILE, never argv: `dsh --profile headless` takes the task
+# positionally and a single argument dies at 128 KB (MAX_ARG_STRLEN) with an
+# exit code no caller can tell apart from a bad answer. The agent reads the file.
+# The sandbox exposes workspaceRoot = process.cwd(), so BOTH of these matter:
+#   - cd into the target, or the workspace is whatever directory the caller
+#     happened to be in. Measured: the same command worked from /tmp and failed
+#     from elsewhere, which is the worst kind of bug to inherit.
+#   - keep the task file INSIDE that tree. A file in /tmp is invisible to the
+#     agent; it reported "/tmp ist leer" and asked for the task to be pasted.
+cd "$TARGET_DIR" || { echo "dsh-task: cannot enter $TARGET_DIR" >&2; exit 3; }
+WORK=$(mktemp -d); OUT="$WORK/out"; ERR="$WORK/err"
+TASKFILE="$TARGET_DIR/.dsh-task-$$.md"
+# The task file MUST live inside the project tree — the sandbox exposes only the
+# working directory — which also puts it in reach of a `git add -A` by the agent.
+# Measured 2026-08-25: a board-dispatched run committed `.dsh-task-3976568.md`
+# into that shared file's history, then the trap below deleted it, leaving a phantom
+# delete in the next diff. `.git/info/exclude` is the repo-LOCAL ignore list that
+# is itself never committed, so this protects every target project without
+# touching a tracked .gitignore.
+if GITDIR=$(git -C "$TARGET_DIR" rev-parse --absolute-git-dir 2>/dev/null); then
+  mkdir -p "$GITDIR/info"
+  grep -qxF '.dsh-task-*.md' "$GITDIR/info/exclude" 2>/dev/null \
+    || echo '.dsh-task-*.md' >> "$GITDIR/info/exclude"
+fi
+cleanup() { rm -rf "$WORK"; rm -f "$TASKFILE"; }
+trap cleanup EXIT
+cat > "$TASKFILE"
+
+"$DSH" --profile "$PROFILE" "${PATCH_ARGS[@]}" \
+  "Lies die Datei $TASKFILE vollstaendig und arbeite die darin beschriebene Aufgabe ab. Die Datei IST die Aufgabe; dieser Satz ist nur der Verweis darauf." \
+  < /dev/null > "$OUT" 2> "$ERR" &
+pid=$!
+wait "$pid"; rc=$?
+pkill -TERM -P "$pid" 2>/dev/null; sleep 0.2; pkill -KILL -P "$pid" 2>/dev/null
+
+FINAL=$(sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' "$OUT" | sed -e :a -e '/^[[:space:]]*$/{$d;N;ba' -e '}')
+if [ -z "${FINAL//[[:space:]]/}" ]; then
+  echo "dsh-task: no final assistant text (dsh exit $rc)" >&2
+  sed -n '1,15p' "$ERR" >&2
+  [ "$rc" -eq 0 ] && exit 5
+  exit "$rc"
+fi
+printf '%s\n' "$FINAL"
+exit 0

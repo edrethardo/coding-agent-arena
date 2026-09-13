@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# Run one agent round with the benchmark's own test code removed from its filesystem.
+#
+#   bin/agent-sandbox <wrapper> <workdir>      stdin = task, stdout = final answer
+#
+# Why this exists. Isolation up to now was "the agent's cwd is outside the repo". That
+# stops an agent that walks up from its cwd -- run B's failure -- but it stops nothing
+# else: the agent runs as the same uid, unsandboxed, with a shell tool. `cat
+# /data/projects/coding_agent_arena/benchmarks/antifa_survivors_v2/grader.py` would have
+# worked in every run so far, and it hands over the exact 24 checks and the state field
+# names they read. An agent that can read the scoring code can satisfy it directly --
+# `__state.bosses.defeated = 1` scores a boss with no boss behind it -- and the number
+# stops meaning anything. Run E's agent did not do this (its own verify.js references
+# nothing of ours), but the benchmark must not depend on the agent's restraint.
+#
+# How. A private mount namespace with a tmpfs over every path holding test code, then
+# privileges dropped straight back to the calling uid. The agent sees an empty directory
+# where the graders were. Nothing outside this process tree is affected: mounts are
+# private to the namespace and vanish when the round exits.
+#
+# unprivileged user namespaces are AppArmor-restricted on this host (bwrap and `unshare
+# -r` both fail), so the namespace is created via `sudo -n unshare` and left immediately
+# with setpriv. The agent itself never runs as root.
+#
+# Env:
+#   ARENA_HIDE        colon-separated extra paths to mask (default: both arena checkouts)
+#   ARENA_WORK_ROOT   the work root whose *other* rows are masked (default ~/arena-work)
+#   ARENA_SANDBOX=0   handled by the caller, not here: this script always sandboxes
+set -uo pipefail
+
+WRAPPER=${1:?usage: agent-sandbox <wrapper> <workdir>}
+WORKDIR=${2:?usage: agent-sandbox <wrapper> <workdir>}
+[ -x "$WRAPPER" ] || { echo "agent-sandbox: wrapper not executable: $WRAPPER" >&2; exit 4; }
+[ -d "$WORKDIR" ] || { echo "agent-sandbox: no such workdir: $WORKDIR" >&2; exit 3; }
+
+WORK_ROOT=$(readlink -f "${ARENA_WORK_ROOT:-$HOME/arena-work}")
+WORKDIR=$(readlink -f "$WORKDIR")
+REPO=$(readlink -f "$(dirname "$0")/..")
+
+# Both checkouts of this project, not just the one we were launched from: a second full
+# copy with the same graders lives in the other one, and hiding one of them hides nothing.
+# ARENA_SERVE_ROOT holds every published build of every run, including later rounds of
+# other runs of the same task. Serving them on the tailnet must not put them back within
+# the agent's reach -- copying a finished build is not building one.
+HIDE_DEFAULT="$REPO:$HOME/code/coding_agent_arena:/data/projects/coding_agent_arena:${ARENA_SERVE_ROOT:-$HOME/arena-serve}"
+IFS=':' read -r -a HIDE <<< "${ARENA_HIDE:-$HIDE_DEFAULT}"
+
+# The wrapper lives inside the repo we are about to hide, so stage a copy outside it.
+STAGE=$(mktemp -d /tmp/arena-sandbox.XXXXXX)
+cp "$WRAPPER" "$STAGE/wrapper"; chmod 755 "$STAGE/wrapper"
+STASH="$STAGE/workdir"; mkdir -p "$STASH"
+REAL_NPM=$(command -v npm || true)
+mkdir -p "$STAGE/bin"
+cat > "$STAGE/bin/npm" <<'NPM'
+#!/usr/bin/env bash
+case "${1:-}" in
+  install|i|ci|add)
+    echo "arena sandbox: dependency installs are disabled; use the browser/runtime already provided" >&2
+    exit 126
+    ;;
+esac
+exec "$ARENA_SB_REAL_NPM" "$@"
+NPM
+chmod 755 "$STAGE/bin/npm"
+cleanup() { rm -rf "$STAGE"; }
+trap cleanup EXIT
+
+# sudo applies secure_path and sets USER=root even under -E; restore the caller's identity
+# on the far side so the agent's environment matches an unsandboxed run.
+export ARENA_SB_PATH="$PATH" ARENA_SB_USER="${USER:-aaron}" \
+       ARENA_SB_UID="$(id -u)" ARENA_SB_GID="$(id -g)" \
+       ARENA_SB_HIDE="${ARENA_HIDE:-$HIDE_DEFAULT}" \
+       ARENA_SB_WORKROOT="$WORK_ROOT" ARENA_SB_WORKDIR="$WORKDIR" ARENA_SB_REAL_NPM="$REAL_NPM" \
+       ARENA_SB_STASH="$STASH" ARENA_SB_STAGE="$STAGE"
+
+# The inner script goes in a FILE, never a heredoc: a heredoc IS stdin, and stdin is the
+# task. Measured while building this: the probe reported "task received 0 bytes" -- the
+# agent would have been handed an empty prompt every round and the runner could not have
+# told that apart from a model that answered nothing.
+cat > "$STAGE/inner.sh" <<'INNER'
+set -uo pipefail
+
+# Keep the real work directory reachable across the tmpfs that is about to cover its
+# parent: bind it aside first, then bind it back into the empty tree.
+mount --bind "$ARENA_SB_WORKDIR" "$ARENA_SB_STASH" || exit 4
+
+# Every path holding grader code becomes an empty tmpfs.
+IFS=':' read -r -a HIDE <<< "$ARENA_SB_HIDE"
+for p in "${HIDE[@]}"; do
+  [ -n "$p" ] && [ -d "$p" ] || continue
+  mount -t tmpfs -o size=64k,mode=0755,noexec,nosuid tmpfs "$p" || exit 4
+done
+
+# The other rows and games under the work root are masked too: a sibling directory can
+# hold another row's finished index.html, and copying one is not building one. Only when
+# the work directory actually lives under that root -- the agentic tier hands out a
+# mkdtemp under /tmp, where there is no sibling to hide and re-binding would be a no-op.
+case "$ARENA_SB_WORKDIR/" in "$ARENA_SB_WORKROOT"/*) UNDER_ROOT=1 ;; *) UNDER_ROOT=0 ;; esac
+if [ "$UNDER_ROOT" = 1 ] && [ -d "$ARENA_SB_WORKROOT" ]; then
+  mount -t tmpfs -o size=64k,mode=0755 tmpfs "$ARENA_SB_WORKROOT" || exit 4
+  chown "$ARENA_SB_UID:$ARENA_SB_GID" "$ARENA_SB_WORKROOT" 2>/dev/null || true
+  mkdir -p "$ARENA_SB_WORKDIR" || exit 4
+  mount --bind "$ARENA_SB_STASH" "$ARENA_SB_WORKDIR" || exit 4
+fi
+
+export PATH="$ARENA_SB_STAGE/bin:$ARENA_SB_PATH" USER="$ARENA_SB_USER" LOGNAME="$ARENA_SB_USER"
+cd "$ARENA_SB_WORKDIR" || exit 3
+exec setpriv --reuid="$ARENA_SB_UID" --regid="$ARENA_SB_GID" --init-groups \
+     -- "$ARENA_SB_STAGE/wrapper" "$ARENA_SB_WORKDIR"
+INNER
+chmod 755 "$STAGE/inner.sh"
+
+exec sudo -n -E unshare --mount --propagation private -- /bin/bash "$STAGE/inner.sh"

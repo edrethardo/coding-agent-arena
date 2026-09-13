@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Run several rows against the same benchmark at the same time.
+#
+#   bin/arena-contest --check --rows hermes-qwen,hermes-claude-opus-5
+#   bin/arena-contest --label H --rows hermes-qwen,hermes-claude-sonnet-5,hermes-claude-opus-5
+#
+# What may run in parallel, and what may not:
+#
+#   * At most ONE row with backend "local". vLLM's counters are server-wide, so a second
+#     local row silently inflates every model-side number of the first and both records
+#     become worthless. The GPU lock is taken only if a local row is in the field, and the
+#     endpoint gate only runs then -- waking a 23 GB engine for a row that never calls it
+#     would be pure harm.
+#   * Any number of "remote" rows. They cost no GPU.
+#   * Grading is serialised regardless, by a lock inside run_game_bench: the fps figure is
+#     measured in a headless browser on THIS machine, and two graders at once measure each
+#     other.
+#
+# Each row gets its own run id `<label>-<timestamp>--<row>` and therefore its own run
+# directory, so no two rows can overwrite each other's evidence. The shared prefix is what
+# groups them into one contest.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+GAME=antifa_survivors_v2; ROWS=""; LABEL=""; TIMEOUT=10800; LOCK_MIN=600; CHECK=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --check)   CHECK=1 ;;
+    --rows)    ROWS="$2"; shift ;;
+    --game)    GAME="$2"; shift ;;
+    --label)   LABEL="$2"; shift ;;
+    --timeout) TIMEOUT="$2"; shift ;;
+    --lock-minutes) LOCK_MIN="$2"; shift ;;
+    *) echo "unknown argument: $1" >&2; exit 64 ;;
+  esac; shift
+done
+[ -n "$ROWS" ] || { echo "usage: bin/arena-contest --rows a,b,c [--label H]" >&2; exit 64; }
+
+LOCK="$HOME/.claude/skills/gpu-lock/gpu-lock.sh"
+export QWEN_BASE_URL="${QWEN_BASE_URL:-http://127.0.0.1:8000/v1}"
+export QWEN_MODEL="${QWEN_MODEL:-Qwen3.8-27B-Instruct}"
+export ARENA_SERVING_CONFIG="${ARENA_SERVING_CONFIG:-setup-1}"
+
+fail=0
+ok()   { printf '  \033[32mok\033[0m    %s\n' "$1"; }
+bad()  { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; fail=1; }
+
+IFS=',' read -r -a ROW_LIST <<< "$ROWS"
+echo "contest: game=$GAME rows=${#ROW_LIST[@]}"
+
+LOCAL_ROWS=()
+for row in "${ROW_LIST[@]}"; do
+  b=$(.venv/bin/python -c "
+import run_game_bench as r, sys
+w = r.WRAPPERS.get('$row')
+print(w[4] if w else 'MISSING')" 2>/dev/null)
+  case "$b" in
+    local)   ok "row $row (local GPU)"; LOCAL_ROWS+=("$row") ;;
+    remote)  ok "row $row (remote API, no GPU)" ;;
+    *)       bad "row '$row' is not in run_game_bench.WRAPPERS" ;;
+  esac
+done
+[ "${#LOCAL_ROWS[@]}" -le 1 ] || bad "${#LOCAL_ROWS[@]} local rows (${LOCAL_ROWS[*]}) -- they share one endpoint and one set of server-wide counters; run them one after another"
+
+# The shared gates: task spec, grader, browser, sandbox. Reused from arena-run so the two
+# launchers cannot drift apart on what they consider safe.
+bin/arena-run --check --game "$GAME" --row "${ROW_LIST[0]}" >/dev/null 2>&1 \
+  && ok "shared gates    task, rounds, grader, browser, sandbox, work dir" \
+  || { echo "  (running the shared preflight verbatim for the diagnosis)"; bin/arena-run --check --game "$GAME" --row "${ROW_LIST[0]}"; fail=1; }
+
+if [ -f "benchmarks/$GAME/bench.json" ] && [ "$CHECK" -eq 0 ]; then
+  for row in "${ROW_LIST[@]}"; do bin/arena-preflight-v3 --row "$row" --game "$GAME" || fail=1; done
+fi
+
+echo
+if [ "$fail" -ne 0 ]; then echo "preflight FAILED -- nothing started"; exit 1; fi
+if [ "$CHECK" -eq 1 ]; then echo "preflight passed (--check: nothing was started)"; exit 0; fi
+
+STAMP="${LABEL:-H}-$(date +%Y%m%dT%H%M%S)"
+if [ "${#LOCAL_ROWS[@]}" -eq 1 ]; then
+  "$LOCK" acquire arena -m "$GAME contest $STAMP: ${LOCAL_ROWS[0]}" -t "$LOCK_MIN" --keep-vllm || exit 1
+  trap '"$LOCK" release arena' EXIT
+  echo "gpu lock held for ${LOCAL_ROWS[0]}"
+else
+  echo "no local row in this field -- the GPU is not touched and no lock is taken"
+fi
+
+pids=()
+for row in "${ROW_LIST[@]}"; do
+  RID="$STAMP--$row"
+  RUN_DIR="benchmarks/$GAME/runs/$RID"
+  mkdir -p "$RUN_DIR"
+  echo "launching $row -> $RUN_DIR"
+  # KEIN setsid. util-linux' setsid forkt genau dann, wenn der Prozess schon
+  # Prozessgruppenleiter ist -- dann beendet sich der Elternprozess sofort, `$!` zeigt auf
+  # ihn statt auf den Runner, `wait` kehrt in Millisekunden zurueck, die EXIT-Falle gibt den
+  # GPU-Lock frei, waehrend die lokale Zeile noch stundenlang rechnet, und der Contest meldet
+  # "finished", bevor eine Runde fertig ist. Gemessen (2026-09-10): ohne Job-Control -- der
+  # Normalfall fuer ein Skript -- forkt setsid NICHT und `wait` funktioniert; mit `set -m`
+  # (interaktive Shell, `bash -m`, ein Aufrufer, der Job-Control anschaltet) kehrt `wait`
+  # sofort zurueck. Der Fehler haengt also allein daran, WIE dieses Skript gestartet wird.
+  # nohup allein genuegt gegen SIGHUP, und der Runner startet seine Agenten ohnehin mit
+  # start_new_session=True -- setsid kaufte hier nichts und riskierte den Lock.
+  ARENA_RUN_ID="$RID" nohup .venv/bin/python -u run_game_bench.py \
+      --config "$row" --game "$GAME" --fresh --timeout "$TIMEOUT" \
+      > "$RUN_DIR/runner.log" 2>&1 &
+  pids+=("$!")
+done
+
+echo
+echo "$STAMP: ${#pids[@]} row(s) running in parallel; pids ${pids[*]}"
+echo "follow: tail -f benchmarks/$GAME/runs/$STAMP--*/runner.log"
+wait "${pids[@]}"
+echo "contest $STAMP finished"

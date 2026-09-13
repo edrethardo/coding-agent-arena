@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# Claude Code as an arena harness. Fifth harness, alongside hermes / dsh / opencode / pi.
+#
+#   CC_MODEL=claude-opus-5 bin/claude-code-task <target-dir> < task.txt
+#
+# Same contract as every other wrapper:
+#   stdin  the task · stdout the final assistant text ONLY
+#   exit 0 ok | 3 timeout | 4 config/credentials unusable | 5 model failure | 8 harness failure
+#
+# Flags, each load-bearing:
+#   -p / --print              non-interactive: run the task and print the final text, no TUI.
+#   --safe-mode               disable all user customizations (plugins, skills, CLAUDE.md, etc.)
+#                             so a benchmark row is not affected by user-installed extensions.
+#   --output-format text      the plain answer on stdout. stream-json would put protocol
+#                             frames where the runner expects the answer.
+#   --model                   pinned per row. Without it the row's recorded model name and
+#                             the model that actually ran are two different claims.
+#   --dangerously-skip-permissions
+#                             a benchmark round cannot stop at an approval prompt; there is
+#                             no terminal to answer it. This is the same accommodation
+#                             hermes gets with --yolo and dsh with its `unattended` preset,
+#                             and it is why every row runs inside bin/agent-sandbox: the
+#                             agent is unrestricted WITHIN a filesystem view that contains
+#                             no grader, no second checkout and no other row's build.
+#
+# The task arrives on stdin and is passed on stdin -- `claude -p` reads it there, so no
+# argv limit applies and the prompt can grow with the rounds.
+set -u
+
+TARGET_DIR="${1:?usage: claude-code-task <target-dir> < task.txt}"
+[ -d "$TARGET_DIR" ] || { echo "claude-code-task: no such directory: $TARGET_DIR" >&2; exit 3; }
+
+CLAUDE_BIN="${CLAUDE_BIN:-claude}"
+[ -x "$CLAUDE_BIN" ] || { echo "claude-code-task: claude not found at $CLAUDE_BIN" >&2; exit 4; }
+MODEL="${CC_MODEL:?CC_MODEL is required (e.g. claude-opus-5)}"
+
+cd "$TARGET_DIR" || exit 3
+
+# CLAUDECODE / CLAUDE_CODE_* leak in from the session that launches the benchmark and would
+# make this run look like a nested child of it. Clear them so the row is its own session.
+unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_SESSION_ID CLAUDE_CODE_CHILD_SESSION \
+      CLAUDE_CODE_BRIDGE_SESSION_ID CLAUDE_CODE_MESSAGING_SOCKET CLAUDE_CODE_MESSAGING_TOKEN \
+      CLAUDE_PID CLAUDE_EFFORT
+
+SESSION_ARGS=()
+if [ -n "${ARENA_SESSION_ID:-}" ]; then
+  if [ "${ARENA_SESSION_CONTINUE:-0}" = 1 ]; then SESSION_ARGS=(--resume "$ARENA_SESSION_ID")
+  else SESSION_ARGS=(--session-id "$ARENA_SESSION_ID"); fi
+fi
+ERR=$(mktemp)
+# Safe mode: disable all user customizations (plugins, skills, CLAUDE.md, hooks, etc.) so that
+# benchmark rows run unaffected by user-installed extensions. Incident: superpowers brainstorming
+# skill hijacked round 1, answering the task prompt with a design question instead of building.
+"$CLAUDE_BIN" --print --safe-mode --output-format text \
+              --model "$MODEL" \
+              --add-dir "$TARGET_DIR" \
+              --dangerously-skip-permissions \
+              "${SESSION_ARGS[@]}" 2>"$ERR"
+rc=$?
+# Ein Resume an einer fehlenden/unlesbaren Sitzung ist kein Modellfehler: Exit 9, der Runner
+# faellt einmal auf eine frische Sitzung zurueck und markiert die Runde (Spec 2.5).
+# Match only the resume-failure phrasing ("No conversation found" or "session id not found"),
+# not any stderr that happens to mention "session" (e.g. "session limit reached").
+if [ "$rc" -ne 0 ] && [ "${ARENA_SESSION_CONTINUE:-0}" = 1 ] && grep -qiE 'no conversation found|session (id )?(not found|does not exist)' "$ERR"; then
+  rm -f "$ERR"; exit 9
+fi
+rm -f "$ERR"
+
+case $rc in
+  0)       exit 0 ;;
+  124|142) exit 3 ;;
+  1)       exit 8 ;;   # harness failure: recorded, does not stop the run
+  *)       exit 5 ;;
+esac

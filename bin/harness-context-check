@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Do the harnesses agree with the server about how big the context is?
+#
+#   bin/harness-context-check            report; exit 1 on any mismatch
+#   bin/harness-context-check --only pi  report all, but fail only on that harness
+#
+# Each harness declares the model's context window in its own config, and none of them ask
+# the server. On 2026-09-09 the served window was changed from 65,536 to 131,072 while a
+# row was running, and nothing anywhere noticed -- the runner recorded a `serving_config`
+# label that nobody verifies. A harness that believes the wrong number either wastes half
+# the window or overruns it and fails in a way that reads like a model problem.
+#
+# This compares what each harness DECLARES against what /v1/models REPORTS. It never edits
+# a config: a silent rewrite would hide exactly the drift this is meant to surface.
+set -uo pipefail
+BASE="${QWEN_BASE_URL:-http://127.0.0.1:8000/v1}"
+
+# Which harness decides the exit code. A run drives ONE harness; the others' configs are
+# worth SEEING (a stale number there is a trap for the next run) but must not block this
+# one. Before --only, a hermes row could not start because pi's models.json still said
+# 65536 -- a file that row never opens. Empty means the old behaviour: every harness
+# counts. The others are still printed, marked "info" instead of "FAIL", so the drift
+# stays visible in the log rather than being silently skipped.
+ONLY=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --only) ONLY="${2:-}"; shift 2 ;;
+    *) echo "usage: $0 [--only <harness>]" >&2; exit 2 ;;
+  esac
+done
+
+served=$(curl -s -m 20 "$BASE/models" 2>/dev/null \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['data'][0].get('max_model_len',''))" 2>/dev/null)
+[ -n "$served" ] || { echo "server did not report max_model_len at $BASE" >&2; exit 2; }
+printf 'served by %s: %s\n\n' "$BASE" "$served"
+
+fail=0
+check() { # name file declared
+  if [ -z "$3" ]; then printf '  %-8s %-46s not declared\n' "$1" "$2"; return; fi
+  if [ "$3" = "$served" ]; then printf '  \033[32mok\033[0m   %-8s %-40s %s\n' "$1" "$(basename "$2")" "$3"
+  elif [ -n "$ONLY" ] && [ "$1" != "$ONLY" ]; then
+    printf '  \033[33minfo\033[0m %-8s %-40s %s (server says %s; not this run)\n' "$1" "$(basename "$2")" "$3" "$served"
+  else printf '  \033[31mFAIL\033[0m %-8s %-40s %s (server says %s)\n' "$1" "$(basename "$2")" "$3" "$served"; fail=1; fi
+}
+
+PI=~/.pi/agent/models.json
+[ -f "$PI" ] && check pi "$PI" "$(python3 -c "
+import json;d=json.load(open('$PI'))
+for p in d.get('providers',{}).values():
+    for m in p.get('models',[]): print(m.get('contextWindow','')); raise SystemExit" 2>/dev/null)"
+
+DSH=~/.dsh/profiles/headless/cordis.patch.yml
+[ -f "$DSH" ] && check dsh "$DSH" "$(grep -oE 'contextWindow:[[:space:]]*[0-9]+' "$DSH" | head -1 | grep -oE '[0-9]+')"
+
+# Die Wurzel, die der LAUF benutzt -- nicht zwangslaeufig die globale. Varianten-Zeilen
+# setzen HERMES_HOME auf eine eigene Wurzel (z.B. ~/.hermes-arena/ctx131072), und geprueft
+# gehoert die Konfiguration, gegen die tatsaechlich gefahren wird.
+HERM="${HERMES_HOME:-$HOME/.hermes}/config.yaml"
+[ -f "$HERM" ] && check hermes "$HERM" "$(grep -oE '^[[:space:]]*context_length:[[:space:]]*[0-9]+' "$HERM" | head -1 | grep -oE '[0-9]+')"
+
+echo
+if [ "$fail" = 0 ]; then
+  if [ -n "$ONLY" ]; then echo "$ONLY agrees with the server (other harnesses reported, not enforced)"
+  else echo "all harnesses agree with the server"; fi
+else
+  echo "MISMATCH -- fix the harness config before running that row; do not let it guess"
+fi
+exit "$fail"

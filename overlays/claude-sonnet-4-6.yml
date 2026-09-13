@@ -1,0 +1,6 @@
+# A/B overlay for run_agentic.py -- used via bin/dsh-task-model, never by the board.
+# The shared ${HOME}/.dsh/claude-backend.yml is deliberately left alone.
+- id: agent-default-model
+  config:
+    provider: anthropic-claude-cli
+    model: claude-sonnet-4-6

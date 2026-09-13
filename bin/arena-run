@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+# Preflight + launch for a game benchmark run.
+#
+# Exists because every run so far was launched by hand-assembling the same six exports, and
+# each hand-assembly got something wrong: a missing per-round task, a wrong working
+# directory, a wipe of the previous run's evidence. The checks below are the post-mortems
+# of runs A-D turned into gates.
+#
+#   bin/arena-run --check                 # run every gate, touch nothing, exit non-zero on failure
+#   bin/arena-run --label F               # gate, take the GPU lock, run, release the lock
+#
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+ROW=hermes-qwen; GAME=antifa_survivors_v2; LABEL=""; TIMEOUT=10800; LOCK_MIN=480; CHECK=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --check)   CHECK=1 ;;
+    --row)     ROW="$2"; shift ;;
+    --game)    GAME="$2"; shift ;;
+    --label)   LABEL="$2"; shift ;;
+    --timeout) TIMEOUT="$2"; shift ;;
+    --lock-minutes) LOCK_MIN="$2"; shift ;;
+    *) echo "unknown argument: $1" >&2; exit 64 ;;
+  esac; shift
+done
+
+# ARENA_GPU_LOCK_BIN lets the preflight be exercised against a stub lock (same override as
+# bin/arena-preflight-v3), so the abort path below can be verified without touching the card.
+LOCK="${ARENA_GPU_LOCK_BIN:-$HOME/.claude/skills/gpu-lock/gpu-lock.sh}"
+BENCH="benchmarks/$GAME"
+export QWEN_BASE_URL="${QWEN_BASE_URL:-http://127.0.0.1:8000/v1}"
+export QWEN_MODEL="${QWEN_MODEL:-Qwen3.8-27B-Instruct}"
+export ARENA_SERVING_CONFIG="${ARENA_SERVING_CONFIG:-setup-1}"
+
+fail=0
+ok()   { printf '  \033[32mok\033[0m    %s\n' "$1"; }
+bad()  { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; fail=1; }
+warn() { printf '  warn  %s\n' "$1"; }
+
+# The one place that actually starts run_game_bench.py, shared by the remote and the local
+# path below so they cannot drift on how a run is launched. ARENA_DRY_RUN=1 prints the exact
+# command instead of running it, so both paths can be verified with no paid API call and no
+# GPU touched.
+launch_row() {
+  export ARENA_RUN_ID="${LABEL:-R}-$(date +%Y%m%dT%H%M%S)"
+  RUN_DIR="$BENCH/runs/$ARENA_RUN_ID"
+  echo "launching $ARENA_RUN_ID -> $RUN_DIR"
+  if [ "${ARENA_DRY_RUN:-0}" = 1 ]; then
+    echo "  (dry run) .venv/bin/python -u run_game_bench.py --config $ROW --game $GAME --fresh --timeout $TIMEOUT 2>&1 | tee $RUN_DIR/runner.log"
+    return 0
+  fi
+  mkdir -p "$RUN_DIR"
+  .venv/bin/python -u run_game_bench.py --config "$ROW" --game "$GAME" --fresh \
+      --timeout "$TIMEOUT" 2>&1 | tee "$RUN_DIR/runner.log"
+}
+
+echo "preflight: row=$ROW game=$GAME"
+
+[ -f "$BENCH/base.txt" ]    && ok "task spec        $BENCH/base.txt" \
+                            || bad "missing         $BENCH/base.txt"
+if [ -f "$BENCH/rounds.json" ]; then
+  n=$(.venv/bin/python -c "import json,sys;print(len(json.load(open('$BENCH/rounds.json'))))" 2>/dev/null)
+  ok "per-round tasks  $n rounds"
+  [ "${n:-0}" -gt 1 ] || bad "only one round defined -- run A failed exactly this way"
+else bad "missing         $BENCH/rounds.json"; fi
+
+if [ -f "$BENCH/grader.py" ]; then ok "grader           $BENCH/grader.py (benchmark-local)"
+else ok "grader           ladder_check.py (shared)"; fi
+
+.venv/bin/python -c "
+import run_game_bench as r, sys
+w = r.WRAPPERS.get('$ROW')
+sys.exit(0 if w else 1)" 2>/dev/null && ok "row wired        $ROW" || bad "row '$ROW' is not in run_game_bench.WRAPPERS"
+
+[ -x /snap/bin/geckodriver ] && ok "grader browser   $(/snap/bin/geckodriver --version 2>/dev/null | head -1)" \
+                             || bad "geckodriver missing at /snap/bin/geckodriver -- every round would score 0"
+
+# The agent must not be able to READ the scoring code, not merely stand outside it. The
+# work-dir gate below is run B's defect; this one is the hole that gate left open, since
+# an absolute path reaches the grader from any cwd. Costs ~2 s and no GPU.
+if [ -x bin/sandbox-selftest ]; then
+  if out=$(bin/sandbox-selftest 2>&1); then
+    ok "agent sandbox    test code unreachable, task/stdin/exit intact"
+  else
+    bad "sandbox selftest failed -- the agent could read the grader:"
+    printf '%s\n' "$out" | sed 's/^/        /'
+  fi
+else bad "bin/sandbox-selftest missing -- isolation would be unverified"; fi
+
+# The agent's working directory MUST be outside this repo: an agent that can read the
+# grader can satisfy it directly. This is run B's defect, as a gate.
+WORK="${ARENA_WORK_ROOT:-$HOME/arena-work}/$GAME/$ROW"
+case "$(readlink -f "$WORK")" in
+  "$(readlink -f .)"*) bad "work dir $WORK is inside the repo -- the agent could read the grader" ;;
+  *) ok "work dir        $WORK (outside the repo)" ;;
+esac
+
+# GPU: never take a card someone else is holding, and never wake vLLM by accident.
+if [ -x "$LOCK" ]; then
+  status="$("$LOCK" status 2>&1)"
+  holder="$(printf '%s' "$status" | head -1)"
+  case "$holder" in
+    "no locks") ok "gpu lock         free" ;;
+    *arena*)    warn "gpu lock is already held as 'arena': $holder" ;;
+    *)          bad "gpu lock held by someone else: $holder -- wait, do not delete it" ;;
+  esac
+  printf '  info  %s\n' "$(printf '%s' "$status" | sed -n 2p)"
+else bad "gpu-lock.sh not found at $LOCK"; fi
+
+# Abort HERE, before anything below can touch :8000. Everything from this point on either
+# contacts the endpoint (harness-context-check, the wake loop) or acquires the lock, and a
+# `fail` that is only acted on at the bottom means a run whose card is held by someone else
+# still woke vLLM twice on its way to the refusal -- exactly what the memory rule "check
+# gpu-lock before any request to :8000" forbids. Reachable via bin/arena-contest too, which
+# calls `arena-run --check` on ROW_LIST[0] before it looks at the lock itself.
+if [ "$fail" -ne 0 ]; then echo "preflight FAILED -- not launching"; exit 1; fi
+
+# Concurrency is allowed, but only where it cannot corrupt a number. Two rows on the local
+# model share one endpoint and one set of server-wide counters, so a second LOCAL row makes
+# both records worthless -- that is the case this refuses. A remote row costs no GPU and
+# may run alongside anything. (Grading is serialised separately, inside run_game_bench:
+# fps is measured in a browser on this machine and two graders would measure each other.)
+MY_BACKEND=$(.venv/bin/python -c "
+import run_game_bench as r
+w = r.WRAPPERS.get('$ROW'); print(w[4] if w else 'unknown')" 2>/dev/null)
+RUNNING_LOCAL=$(.venv/bin/python - <<'PYEOF' 2>/dev/null
+import re, subprocess
+import run_game_bench as r
+try:
+    out = subprocess.run(["pgrep", "-af", "run_game_bench[.]py"],
+                         capture_output=True, text=True).stdout
+except Exception:
+    out = ""
+rows = []
+for line in out.splitlines():
+    m = re.search(r"--config\s+(\S+)", line)
+    if m:
+        w = r.WRAPPERS.get(m.group(1))
+        if w and w[4] == "local":
+            rows.append(m.group(1))
+print(",".join(rows))
+PYEOF
+)
+if [ "$MY_BACKEND" = "local" ] && [ -n "$RUNNING_LOCAL" ]; then
+  bad "a local row is already running ($RUNNING_LOCAL) -- two rows on the local model share one endpoint and one set of server-wide counters, and both records become worthless"
+elif [ -n "$RUNNING_LOCAL" ]; then
+  ok "concurrency      $RUNNING_LOCAL holds the local model; this row is $MY_BACKEND, no conflict"
+else
+  ok "concurrency      no local row in flight (this row is $MY_BACKEND)"
+fi
+
+# The engine is socket-activated and idle-stops. A single 15 s curl therefore failed the
+# whole preflight on a cold box, which reads like a dead endpoint and is not one -- loading
+# ~23 GB of weights takes longer than that. Wait, and say so. Safe here only because the
+# lock check above already established that the card is free or ours: waking the engine
+# takes the VRAM from whatever else is on it.
+if [ "$MY_BACKEND" != "local" ]; then
+  ok "endpoint         not applicable: $ROW is a $MY_BACKEND row and never calls :8000"
+  echo
+  if [ -f "$BENCH/bench.json" ] && [ "$CHECK" -eq 0 ]; then
+    bin/arena-preflight-v3 --row "$ROW" --game "$GAME" || fail=1
+  fi
+  if [ "$fail" -ne 0 ]; then echo "preflight FAILED -- not launching"; exit 1; fi
+  [ "$CHECK" -eq 1 ] && { echo "preflight passed (--check: nothing was started)"; exit 0; }
+  # Bug found by the integration run (2026-09-10), never exercised before because v2 only
+  # ever launched remote rows through arena-contest: this branch used to fall through past
+  # here into the local-only section below -- harness-context-check, the /v1/models endpoint
+  # wait (which woke vLLM with no lock held), and finally a GPU lock acquire, all for a row
+  # that never touches the card. A remote row is fully gated above; launch and stop here.
+  launch_row
+  exit $?
+fi
+
+ENDPOINT_WAIT=${ENDPOINT_WAIT:-300}
+model=""; deadline=$(( $(date +%s) + ENDPOINT_WAIT )); announced=0
+while [ -z "$model" ] && [ "$(date +%s)" -lt "$deadline" ]; do
+  model="$(curl -s -m 20 "$QWEN_BASE_URL/models" 2>/dev/null | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)"
+  [ -n "$model" ] && break
+  [ "$announced" = 0 ] && { printf '  ...   waking the engine at %s (up to %ss)\n' "$QWEN_BASE_URL" "$ENDPOINT_WAIT"; announced=1; }
+  sleep 10
+done
+[ -n "$model" ] && ok "endpoint         $model at $QWEN_BASE_URL" \
+                || bad "endpoint $QWEN_BASE_URL did not answer within ${ENDPOINT_WAIT}s"
+
+# AFTER the wake loop above, not before it. :8000 is socket-activated and idle-stops, so on a
+# cold box this check's single 20 s curl found nothing, reported "server did not report
+# max_model_len", and failed the whole preflight -- for an engine that was merely asleep and
+# that the very next block then woke successfully. The check needs a server that answers.
+#
+# A local row's harness must agree with the server about the window size. Hermes takes
+# `model.context_length` as an OVERRIDE: with 65536 pinned in its config it compresses at
+# 0.5 x 65536 regardless of the server serving 131072, so raising the server alone changes
+# nothing and the run fails exactly as before -- while the record would suggest the bigger
+# window had been tested.
+# The check reads ${HERMES_HOME:-~/.hermes}/config.yaml, so it has to be told which root
+# this ROW runs against: every v3 qwen variant has its own (~/.hermes-arena/v3-*), and
+# checking ~/.hermes instead validated a config the run never loads -- exactly the drift
+# this gate exists to catch, checked on the wrong file.
+ROW_HERMES_HOME=$(.venv/bin/python -c "
+import run_game_bench as r
+w = r.WRAPPERS.get('$ROW')
+print((w[1] or {}).get('HERMES_HOME', '') if w else '')" 2>/dev/null)
+# The harness this row actually drives. Only its declared window decides the gate; the
+# others are reported but not enforced (see --only in harness-context-check). Without
+# this, a stale contextWindow in a harness the row never loads blocks the launch.
+ROW_HARNESS=$(.venv/bin/python -c "
+import run_game_bench as r
+w = r.WRAPPERS.get('$ROW')
+print(w[2] if w else '')" 2>/dev/null)
+if [ -x bin/harness-context-check ]; then
+  if out=$(HERMES_HOME="${ROW_HERMES_HOME:-${HERMES_HOME:-$HOME/.hermes}}" bin/harness-context-check ${ROW_HARNESS:+--only "$ROW_HARNESS"} 2>&1); then
+    ok "context windows  harnesses agree with the server${ROW_HERMES_HOME:+ (hermes root $ROW_HERMES_HOME)}"
+  else
+    bad "harness context window disagrees with the server:"
+    printf '%s\n' "$out" | sed 's/^/        /'
+  fi
+fi
+
+echo
+if [ -f "$BENCH/bench.json" ] && [ "$CHECK" -eq 0 ]; then
+  bin/arena-preflight-v3 --row "$ROW" --game "$GAME" || fail=1
+fi
+if [ "$fail" -ne 0 ]; then echo "preflight FAILED -- not launching"; exit 1; fi
+if [ "$CHECK" -eq 1 ]; then echo "preflight passed (--check: nothing was started)"; exit 0; fi
+
+if [ "${ARENA_DRY_RUN:-0}" = 1 ]; then
+  echo "  (dry run) $LOCK acquire arena -m \"$GAME: $ROW, label=${LABEL:-R}\" -t $LOCK_MIN --keep-vllm"
+else
+  "$LOCK" acquire arena -m "$GAME: $ROW, label=${LABEL:-R}" -t "$LOCK_MIN" --keep-vllm || exit 1
+  trap '"$LOCK" release arena' EXIT
+fi
+
+launch_row
